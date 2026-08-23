@@ -1,6 +1,6 @@
 """
-نظام بصير للرصد والفرز الإسعافي والأمني المبكر
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
+Full English UI with Persistent Anomaly Bounding Box Tracking & Continuous Video Stream
 """
 
 import math
@@ -20,7 +20,7 @@ import streamlit as st
 # ============================================================================
 
 st.set_page_config(
-    page_title="بصير | منصة الرصد والفرز المبكر الموحدة",
+    page_title="Baseer | AI Anomaly Detection & Triage Platform",
     page_icon="🚑",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -29,8 +29,8 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=JetBrains+Mono:wght@500;700&display=swap');
-    * { font-family: 'Tajawal', -apple-system, sans-serif; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&family=JetBrains+Mono:wght@500;700&display=swap');
+    * { font-family: 'Inter', -apple-system, sans-serif; }
     code, .mono { font-family: 'JetBrains Mono', monospace !important; }
 
     .block-container { padding-top: 1.2rem; max-width: 1440px; }
@@ -94,7 +94,7 @@ st.markdown(
         color: white;
         font-family: 'JetBrains Mono', monospace;
     }
-    .card-ar { font-size: 1.05rem; font-weight: 800; color: #F8FAFC; margin-top: 0.4rem; }
+    .card-title { font-size: 1.05rem; font-weight: 800; color: #F8FAFC; margin-top: 0.4rem; }
     .card-en { font-size: 0.82rem; color: #94A3B8; margin-bottom: 0.25rem; }
     .card-meta { color: #64748B; font-size: 0.78rem; font-family: 'JetBrains Mono', monospace; }
     .category-tag {
@@ -112,111 +112,104 @@ st.markdown(
 )
 
 # ============================================================================
-# TAXONOMY MAPPING (INCLUDING SUNSTROKE)
+# ENGLISH TAXONOMY MAPPING
 # ============================================================================
 
 TAXONOMY_RULES = {
-    # Sunstroke & Heat Emergency
     "sunstroke_heat_exhaustion": {
         "category": "Heat Emergencies & Insolation",
-        "ar": "ضربة شمس وإجهاد حراري حاد",
+        "title": "Sunstroke / Extreme Heat Exhaustion",
         "en": "sunstroke_heat_exhaustion",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "☀️",
-        "action": "نقل المصاب لمظلة تبريد فوراً ورش الماء ونقله للإسعاف",
+        "action": "Immediate evacuation to cooling shelter & emergency medical response.",
     },
-
-    # Physical Violence & Assaults
     "fighting": {
         "category": "Physical Violence & Assaults",
-        "ar": "شجار واشتباك جسدي",
+        "title": "Physical Altercation / Fighting",
         "en": "fighting",
         "priority": "High",
         "color": "#F97316",
         "icon": "🥊",
-        "action": "توجيه دورية أمن الميدان فوراً لفض الاشتباك",
+        "action": "Dispatch security officers immediately to de-escalate.",
     },
-
-    # Falls & Complex Medical Emergencies
     "sudden_fall": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "سقوط مفاجئ وفقدان فوري للتوازن",
+        "category": "Falls & Medical Emergencies",
+        "title": "Sudden Fall & Sudden Balance Loss",
         "en": "sudden_fall",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "🚨",
-        "action": "توجيه فرقة التدخل السريع",
+        "action": "Dispatch Rapid Response Team to location.",
     },
     "slow_fall": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "سقوط بطيء وتدريجي",
+        "category": "Falls & Medical Emergencies",
+        "title": "Gradual / Slow Fall Incident",
         "en": "slow_fall",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "⬇️",
-        "action": "فحص العلامات الحيوية ونقل المصاب",
+        "action": "Check vital signs and transport patient.",
     },
     "sudden_fall_followed_by_seizure": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "سقوط مفاجئ متبوع بنوبة تشنج/صرع",
+        "category": "Falls & Medical Emergencies",
+        "title": "Sudden Fall Followed by Seizure",
         "en": "sudden_fall_followed_by_seizure",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "⚡",
-        "action": "تأمين محيط المصاب وحماية الرأس وتوجيه إسعاف عاجل",
+        "action": "Secure perimeter, protect head & dispatch paramedic urgent team.",
     },
     "lying_immobile": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "استلقاء وسقوط بدون حركة (فقدان وعي)",
+        "category": "Falls & Medical Emergencies",
+        "title": "Person Lying Immobile / Unconscious",
         "en": "lying_immobile",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "🛑",
-        "action": "توجيه فريق الإنعاش القلبي الرئوي",
+        "action": "Dispatch CPR medical response unit.",
     },
-
-    # Abnormal Gait & Physical Fatigue
     "regular_limping": {
         "category": "Abnormal Gait & Fatigue",
-        "ar": "عرج منتظم (خطوات متشابهة ومتكررة)",
+        "title": "Regular Limping Gait Detected",
         "en": "regular_limping",
         "priority": "Medium",
         "color": "#F59E0B",
         "icon": "🚶",
-        "action": "توجيه كرسي إسعافي متحرك لنقل المصاب",
+        "action": "Dispatch mobile wheelchair transport.",
     },
     "irregular_limping": {
         "category": "Abnormal Gait & Fatigue",
-        "ar": "عرج غير منتظم (خطوات متغيرة وغير متناسقة)",
+        "title": "Irregular / Asymmetric Limping Gait",
         "en": "irregular_limping",
         "priority": "High",
         "color": "#F97316",
         "icon": "👣",
-        "action": "تنبيه نقطة الرعاية الميدانية وتفقد القدم",
+        "action": "Alert field triage point for lower limb inspection.",
     },
     "Exhausted_walking": {
         "category": "Abnormal Gait & Fatigue",
-        "ar": "مشي بإجهاد وإعياء حاد",
+        "title": "Severe Physical Exhaustion / Weak Gait",
         "en": "Exhausted_walking",
         "priority": "High",
         "color": "#F97316",
         "icon": "😫",
-        "action": "تقديم السوائل ونقل المصاب لمنطقة التبريد",
+        "action": "Provide hydration and escort to rest station.",
     },
 }
 
 PRIORITY_COLOR = {"Critical": "#DC2626", "High": "#F97316", "Medium": "#F59E0B", "Low": "#3B82F6"}
 
 LOCATIONS = [
-    "ممشى المشاعر – ممر رقم 12 (Pilgrim Corridor 12)",
-    "ساحة الحرم المركزية – بوابة الملك فهد (King Fahd Gate)",
-    "محطة قطار الحرمين – الصالة 2 (Train Station Hub)",
-    "المستشفى الميداني – محيط جسر الجمرات (Jamarat Bridge)",
+    "Pilgrim Corridor 12 (Mashaer Walkway)",
+    "King Fahd Gate - Central Courtyard",
+    "Haramain Train Station - Terminal 2",
+    "Field Hospital - Jamarat Bridge Precinct",
 ]
 
 # ============================================================================
-# DATA STRUCTURES & TRACKING
+# DATA STRUCTURES
 # ============================================================================
 
 @dataclass
@@ -229,7 +222,6 @@ class Alert:
     location: str
     condition_key: str
     confidence: float
-    dispatched: bool = False
 
 
 class Track:
@@ -261,8 +253,6 @@ def extract_features(track: Track):
     aspect_ratios = [w / max(h, 1.0) for w, h in zip(widths, heights)]
 
     aspect_curr = float(np.mean(aspect_ratios[-3:]))
-    aspect_prev = float(np.mean(aspect_ratios[:3]))
-
     h_drop = (np.mean(heights[:3]) - np.mean(heights[-3:])) / max(np.mean(heights[:3]), 1.0)
     vert_v = np.diff(cys) / curr_h
     horiz_v = np.diff(cxs) / curr_h
@@ -273,9 +263,7 @@ def extract_features(track: Track):
 
     return dict(
         aspect_curr=aspect_curr,
-        aspect_prev=aspect_prev,
         h_drop=h_drop,
-        max_vert_v=float(np.max(np.abs(vert_v))) if len(vert_v) else 0.0,
         displacement=displacement,
         speed_mean=speed_mean,
         speed_jitter=speed_jitter,
@@ -285,21 +273,21 @@ def extract_features(track: Track):
 def classify_taxonomy(f: dict, sensitivity: int):
     s = sensitivity / 100.0
 
-    # 1. رصد ضربة الشمس (Sunstroke): مشي بطيء جداً، ترنح خفيف، وانحناء قليل في البنية
+    # Sunstroke
     if f["speed_mean"] < 0.015 and 0.015 < f["speed_jitter"] < 0.04 and f["aspect_curr"] > 0.6:
         return "sunstroke_heat_exhaustion", min(0.96, 0.75 + 0.2 * s)
 
-    # 2. رصد السقوط المفاجئ والتشنج
+    # Fall & Seizure
     if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.25 * (1.1 - 0.3 * s)):
         if f["speed_jitter"] > 0.03:
             return "sudden_fall_followed_by_seizure", min(0.98, 0.80 + 0.15 * s)
         return "sudden_fall", min(0.95, 0.78 + 0.18 * s)
 
-    # 3. الاستلقاء بدون حركة
+    # Lying Immobile
     if f["aspect_curr"] > 1.10 and f["displacement"] < 0.20:
         return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
 
-    # 4. العرج والإجهاد
+    # Limping & Fatigue
     if f["speed_jitter"] > 0.035:
         if f["speed_jitter"] > 0.07:
             return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 3.0)
@@ -321,6 +309,7 @@ def new_state():
         "tracks": {},
         "next_id": 1,
         "global_cd": {},
+        "persistent_anomalies": [], # 🌟 ذاكرة حفظ أماكن الأنومالي
     }
 
 
@@ -331,7 +320,7 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
 
     if state["prev_gray"] is None:
         state["prev_gray"] = gray
-        return canvas, [], 1
+        return canvas, [], 0
 
     frame_diff = cv2.absdiff(state["prev_gray"], gray)
     state["prev_gray"] = gray
@@ -343,15 +332,10 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
 
     detections = []
     for c in contours:
-        if cv2.contourArea(c) < 400:
+        if cv2.contourArea(c) < 350:
             continue
         x, y, w, h = cv2.boundingRect(c)
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h)))
-
-    # ضامن التتبع لضمان استمرار تحرك البث حتى مع بطء الحركة
-    if not detections:
-        h_f, w_f, _ = frame.shape
-        detections.append(((w_f / 2, h_f / 2), (int(w_f * 0.35), int(h_f * 0.2), int(w_f * 0.3), int(h_f * 0.6))))
 
     assigned = set()
     for (cx, cy), (x, y, w, h) in detections:
@@ -375,39 +359,40 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
         del state["tracks"][tid]
 
     new_alerts = []
-    active_count = 0
 
     for tid, tr in state["tracks"].items():
-        active_count += 1
         x, y, w, h = tr.bbox
         f = extract_features(tr)
 
-        is_abnormal = False
         if f:
             cond, conf = classify_taxonomy(f, sensitivity)
             if cond and cond in TAXONOMY_RULES:
-                is_abnormal = True
                 info = TAXONOMY_RULES[cond]
-                color = (0, 0, 255) # أحمر بارز للحالات الحرجة
-                tag = f"⚠️ {info['ar']} ({conf*100:.0f}%)"
+                tag = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
+
+                # حفظ المربع في الذاكرة الدائمة ليبقى على الفيديو طوال العرض
+                state["persistent_anomalies"].append({"bbox": (x, y, w, h), "label": tag})
 
                 last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 120:
+                if frame_idx - last_f > 100:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
 
-        # رسم Bounding Box بارز وأحمر حصرًا عند رصد حالة Abnormal
-        if is_abnormal:
-            cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 3)
-            (text_w, text_h), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-            cv2.rectangle(canvas, (x, max(y - 25, 0)), (x + text_w + 10, max(y, 25)), color, -1)
-            cv2.putText(canvas, tag, (x + 5, max(y - 7, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+    # 🎨 رسم كافة المربعات المسجلة كـ Abnormal طول مدة الفيديو
+    for anomaly in state["persistent_anomalies"]:
+        ax, ay, aw, ah = anomaly["bbox"]
+        label = anomaly["label"]
+        cv2.rectangle(canvas, (ax, ay), (ax + aw, ay + ah), (0, 0, 255), 3)
+        
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 2)
+        cv2.rectangle(canvas, (ax, max(ay - 22, 0)), (ax + tw + 8, max(ay, 22)), (0, 0, 255), -1)
+        cv2.putText(canvas, label, (ax + 4, max(ay - 6, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
 
-    return canvas, new_alerts, active_count
+    return canvas, new_alerts, len(state["tracks"])
 
 
 # ============================================================================
-# STREAMLIT UI & CONTROL
+# STREAMLIT UI & RUNTIME
 # ============================================================================
 
 if "alerts" not in st.session_state:
@@ -419,8 +404,8 @@ st.markdown(
     """
     <div class="header-box">
         <div>
-            <div class="system-title">🚑 نظام بصير | AI Anomaly Detection & Triage</div>
-            <div class="system-sub">منظومة الرصد والفرز الذكي للمؤشرات الحيوية والحركية الحرجة</div>
+            <div class="system-title">🚑 BASEER | AI Anomaly Detection Command Center</div>
+            <div class="system-sub">Early Multi-Modal Medical & Safety Anomaly Detection</div>
         </div>
         <div class="live-badge">● LIVE DISPATCH SYSTEM</div>
     </div>
@@ -429,28 +414,22 @@ st.markdown(
 )
 
 with st.sidebar:
-    st.markdown("### 🎛️ غرفة العمليات والتحكم")
-    st.caption("Operations & Taxonomy Control Hub")
+    st.markdown("### 🎛️ Command Center Controls")
 
-    feed_mode = st.radio(
-        "مصدر البث (Feed Source)",
-        ["رفع فيديو مراقبة (Upload Video)"],
-    )
-
-    uploaded_vid = st.file_uploader("اختر مقطع الكاميرا (.mp4)", type=["mp4", "avi", "mov"])
+    uploaded_vid = st.file_uploader("Upload Surveillance Clip (.mp4)", type=["mp4", "avi", "mov"])
 
     st.markdown("---")
-    selected_zone = st.selectbox("نطاق الكاميرا والموقع (Zone)", LOCATIONS)
-    sens = st.slider("حساسية الرصد والاستجابة (Sensitivity)", 20, 100, 70)
+    selected_zone = st.selectbox("Zone Location", LOCATIONS)
+    sens = st.slider("Detection Sensitivity", 20, 100, 70)
 
     st.markdown("---")
-    play_speed = st.slider("معدل العرض (FPS)", 6, 30, 16)
-    max_f = st.slider("إجمالي الإطارات للفحص (Max Frames)", 80, 1000, 400, step=20)
+    play_speed = st.slider("Playback FPS Speed", 10, 30, 20)
+    max_f = st.slider("Max Processing Frames", 100, 1500, 500, step=50)
 
     st.markdown("---")
     col1, col2 = st.columns(2)
-    start_btn = col1.button("▶ تشغيل الرصد", use_container_width=True, type="primary")
-    reset_btn = col2.button("⟲ إعادة ضبط", use_container_width=True)
+    start_btn = col1.button("▶ Run Stream", use_container_width=True, type="primary")
+    reset_btn = col2.button("⟲ Reset", use_container_width=True)
 
     if reset_btn:
         st.session_state.alerts = []
@@ -460,30 +439,30 @@ with st.sidebar:
 col_cam, col_triage = st.columns([1.35, 1])
 
 with col_cam:
-    st.markdown("##### 📹 البث التحليلي المباشر (Analytical Feed)")
+    st.markdown("##### 📹 Analytical Feed (Continuous Stream)")
     cam_holder = st.empty()
     kpi_holder = st.empty()
 
 with col_triage:
-    st.markdown("##### 🚨 سجل الفرز والتوجيه الميداني (Live Triage Log)")
+    st.markdown("##### 🚨 Live Triage & Dispatch Log")
     triage_holder = st.empty()
 
 
 def draw_kpi_html(m):
     return f"""
     <div class="kpi-container">
-        <div class="kpi-card"><div class="kpi-num">{m['frame']}</div><div class="kpi-title">الإطار (Frame)</div></div>
-        <div class="kpi-card"><div class="kpi-num">{m['time']:.1f}s</div><div class="kpi-title">الزمن (Time)</div></div>
-        <div class="kpi-card"><div class="kpi-num">{m['tracks']}</div><div class="kpi-title">الأشخاص (Active)</div></div>
-        <div class="kpi-card"><div class="kpi-num">{m['fps']:.1f}</div><div class="kpi-title">المعالجة (FPS)</div></div>
-        <div class="kpi-card"><div class="kpi-num" style="color:#EF4444">{len(st.session_state.alerts)}</div><div class="kpi-title">البلاغات (Alerts)</div></div>
+        <div class="kpi-card"><div class="kpi-num">{m['frame']}</div><div class="kpi-title">Frame</div></div>
+        <div class="kpi-card"><div class="kpi-num">{m['time']:.1f}s</div><div class="kpi-title">Time</div></div>
+        <div class="kpi-card"><div class="kpi-num">{m['tracks']}</div><div class="kpi-title">Active</div></div>
+        <div class="kpi-card"><div class="kpi-num">{m['fps']:.1f}</div><div class="kpi-title">FPS</div></div>
+        <div class="kpi-card"><div class="kpi-num" style="color:#EF4444">{len(st.session_state.alerts)}</div><div class="kpi-title">Alerts</div></div>
     </div>
     """
 
 
 def draw_triage_html():
     if not st.session_state.alerts:
-        return "<div style='color:#94A3B8; padding:1rem; border:1px dashed #334155; border-radius:8px;'>لا توجد بلاغات إسعافية حتى الآن. النظام يراقب البث...</div>"
+        return "<div style='color:#94A3B8; padding:1rem; border:1px dashed #334155; border-radius:8px;'>No critical anomalies detected yet. Monitoring live feed...</div>"
 
     html_out = ""
     for idx, a in enumerate(reversed(st.session_state.alerts)):
@@ -497,10 +476,10 @@ def draw_triage_html():
                 <span class="card-meta">#{a.id} · {a.wall_clock} · t={a.video_time_s:.1f}s</span>
             </div>
             <div style="margin-top:0.3rem;"><span class="category-tag">📂 {info['category']}</span></div>
-            <div class="card-ar">{info['icon']} {info['ar']}</div>
-            <div class="card-en"><b>Class:</b> <code>{info['en']}</code> (الثقة: {a.confidence*100:.0f}%)</div>
+            <div class="card-title">{info['icon']} {info['title']}</div>
+            <div class="card-en"><b>Class:</b> <code>{info['en']}</code> (Conf: {a.confidence*100:.0f}%)</div>
             <div class="card-meta">📍 {a.location}</div>
-            <div style="margin-top:0.4rem; font-size:0.8rem; color:#CBD5E1;"><b>الإجراء الموصى به:</b> {info['action']}</div>
+            <div style="margin-top:0.4rem; font-size:0.8rem; color:#CBD5E1;"><b>Recommended Action:</b> {info['action']}</div>
         </div>
         """
     return html_out
@@ -508,7 +487,7 @@ def draw_triage_html():
 
 def run_detection():
     if uploaded_vid is None:
-        st.warning("الرجاء رفع ملف فيديو أولاً لتشغيل البث.")
+        st.warning("Please upload a video file to run the analytical stream.")
         return
 
     st.session_state.alerts = []
@@ -568,7 +547,8 @@ def run_detection():
             "time": frame_idx / fps_src,
         }
 
-        cam_holder.image(rgb, use_container_width=True, output_format="JPEG")
+        # تحديث المكونات بسلاسة دون تجمد
+        cam_holder.image(rgb, channels="RGB", use_container_width=True)
         kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
         triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
 
