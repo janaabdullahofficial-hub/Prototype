@@ -1,6 +1,6 @@
 """
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
-Parallel Threaded Streaming Pipeline & Dynamic Real-Time Bounding Box Removal
+Full Stream Control with Smooth Frame-by-Frame Rendering
 """
 
 import math
@@ -18,11 +18,11 @@ import numpy as np
 import streamlit as st
 
 # ============================================================================
-# PAGE CONFIG & SYSTEM THEME
+# PAGE CONFIG & STYLES
 # ============================================================================
 
 st.set_page_config(
-    page_title="Baseer | AI Anomaly Detection & Triage Platform",
+    page_title="Baseer | AI Anomaly Detection Platform",
     page_icon="🚑",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -114,7 +114,7 @@ st.markdown(
 )
 
 # ============================================================================
-# ENGLISH TAXONOMY
+# TAXONOMY MAPPING
 # ============================================================================
 
 TAXONOMY_RULES = {
@@ -144,15 +144,6 @@ TAXONOMY_RULES = {
         "color": "#DC2626",
         "icon": "🚨",
         "action": "Dispatch Rapid Response Team to location.",
-    },
-    "slow_fall": {
-        "category": "Falls & Medical Emergencies",
-        "title": "Gradual / Slow Fall Incident",
-        "en": "slow_fall",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "⬇️",
-        "action": "Check vital signs and transport patient.",
     },
     "sudden_fall_followed_by_seizure": {
         "category": "Falls & Medical Emergencies",
@@ -229,7 +220,7 @@ class Alert:
 class Track:
     def __init__(self, track_id, centroid, bbox, frame_idx):
         self.id = track_id
-        self.history = deque(maxlen=20)
+        self.history = deque(maxlen=15)
         self.age = 0
         self.update(centroid, bbox, frame_idx)
 
@@ -243,7 +234,7 @@ class Track:
 
 def extract_features(track: Track):
     hist = list(track.history)
-    if len(hist) < 4:
+    if len(hist) < 3:
         return None
 
     heights = [h["b"][3] for h in hist]
@@ -285,19 +276,19 @@ def classify_taxonomy(f: dict, sensitivity: int):
     if f["aspect_curr"] > 1.15 and f["displacement"] < 0.15:
         return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
 
-    if f["speed_jitter"] > 0.05:
-        if f["speed_jitter"] > 0.09:
+    if f["speed_jitter"] > 0.06:
+        if f["speed_jitter"] > 0.1:
             return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 2.5)
         return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 2.5)
 
-    if f["speed_mean"] < 0.025 and f["h_drop"] > 0.1:
+    if f["speed_mean"] < 0.025 and f["h_drop"] > 0.12:
         return "Exhausted_walking", min(0.85, 0.60 + 0.2 * s)
 
     return None, 0.0
 
 
 # ============================================================================
-# PARALLEL PROCESSING THREAD PIPELINE
+# THREADED WORKER & ENGINE
 # ============================================================================
 
 def frame_producer(video_path, max_frames, frame_queue):
@@ -325,7 +316,7 @@ def new_state():
 def process_video_frame(frame, frame_idx, state, sensitivity):
     canvas = frame.copy()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (15, 15), 0)
+    gray = cv2.GaussianBlur(gray, (11, 11), 0)
 
     if state["prev_gray"] is None:
         state["prev_gray"] = gray
@@ -334,21 +325,22 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
     frame_diff = cv2.absdiff(state["prev_gray"], gray)
     state["prev_gray"] = gray
 
-    _, thresh = cv2.threshold(frame_diff, 20, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(frame_diff, 22, 255, cv2.THRESH_BINARY)
     thresh = cv2.dilate(thresh, None, iterations=2)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detections = []
     for c in contours:
-        if cv2.contourArea(c) < 600:
+        # تخفيض الحد لرصد الأجسام البعيدة فور ورودها في الحركة
+        if cv2.contourArea(c) < 250:
             continue
         x, y, w, h = cv2.boundingRect(c)
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h)))
 
     assigned = set()
     for (cx, cy), (x, y, w, h) in detections:
-        best_id, best_d = None, 120.0
+        best_id, best_d = None, 100.0
         for tid, tr in state["tracks"].items():
             if tid in assigned:
                 continue
@@ -364,8 +356,8 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
             state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
             assigned.add(tid)
 
-    # حرق المسارات المتوقفة أو الخارجة فم فوراً لتفريغ الشاشة
-    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 5]:
+    # تنظيف وتفريغ الأهداف غير النشطة
+    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 2]:
         del state["tracks"][tid]
 
     new_alerts = []
@@ -380,14 +372,13 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
                 info = TAXONOMY_RULES[cond]
                 label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
 
-                # 🟢 رسم المربع الأحمر بشكل مؤقت وحين وجود العَرَض فقط
                 cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 2)
                 cv2.rectangle(canvas, (x, max(y - 20, 0)), (x + tw + 6, max(y, 20)), (0, 0, 255), -1)
                 cv2.putText(canvas, label, (x + 3, max(y - 5, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
                 last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 75:
+                if frame_idx - last_f > 60:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
 
@@ -423,11 +414,11 @@ with st.sidebar:
 
     st.markdown("---")
     selected_zone = st.selectbox("Zone Location", LOCATIONS)
-    sens = st.slider("Detection Sensitivity", 20, 100, 70)
+    sens = st.slider("Detection Sensitivity", 20, 100, 75)
 
     st.markdown("---")
-    play_speed = st.slider("Playback FPS Speed", 15, 30, 24)
-    max_f = st.slider("Max Processing Frames", 100, 1500, 500, step=50)
+    play_speed = st.slider("Playback Speed (FPS Target)", 10, 60, 25)
+    max_f = st.slider("Max Processing Frames", 100, 1500, 600, step=50)
 
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -501,7 +492,7 @@ def run_detection():
     tfile_path = tf.name
     tf.close()
 
-    frame_queue = queue.Queue(maxsize=30)
+    frame_queue = queue.Queue(maxsize=50)
     prod_thread = threading.Thread(target=frame_producer, args=(tfile_path, max_f, frame_queue), daemon=True)
     prod_thread.start()
 
@@ -509,10 +500,10 @@ def run_detection():
     fps_src = 25.0
     start_t = time.time()
     proc = 0
-    target_delay = 1.0 / play_speed
+
+    frame_delay = 1.0 / max(play_speed, 1)
 
     while True:
-        loop_start = time.time()
         frame_idx, raw = frame_queue.get()
 
         if frame_idx is None:
@@ -548,14 +539,19 @@ def run_detection():
             "time": frame_idx / fps_src,
         }
 
+        # 🟢 عرض الإطار الحالي في المتصفح
         cam_holder.image(rgb, channels="RGB", use_container_width=True)
-        kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
-        triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
 
-        compute_duration = time.time() - loop_start
-        sleep_time = target_delay - compute_duration
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+        # 🟢 وقت تأخير لإعطاء المتصفح مهلة لتنفيذ تحديث الرسوميات وسلاسة العرض
+        time.sleep(frame_delay)
+
+        # تحديث لوحة التحكم وسجل التنبيهات كل 2 إطار لتخفيف العبء على Streamlit
+        if proc % 2 == 0:
+            kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
+            triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
+
+    kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
+    triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
 
     if os.path.exists(tfile_path):
         try:
