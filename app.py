@@ -450,14 +450,20 @@ def classify_taxonomy(f: dict, sensitivity: int):
 # OPENCV ENGINE (ANTI-CLUTTER FILTERED)
 # ============================================================================
 
+# Built once at import time instead of once per frame -> removes a repeated,
+# unnecessary allocation from the hottest loop in the app.
+_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+
+
 def new_state():
     bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
     return {"bg": bg, "tracks": {}, "next_id": 1, "global_cd": {}}
 
 
 def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    kernel_open = _KERNEL_OPEN
+    kernel_close = _KERNEL_CLOSE
 
     fgmask = state["bg"].apply(frame)
     _, fgmask = cv2.threshold(fgmask, 220, 255, cv2.THRESH_BINARY)
