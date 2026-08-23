@@ -1,9 +1,6 @@
 """
 نظام بصير للرصد والفرز الإسعافي والأمني المبكر
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
-========================================================================
-- Smooth Frame-by-Frame Video Playback (No Frozen Frames)
-- Custom Dynamic Taxonomy Tracker
 """
 
 import math
@@ -115,11 +112,22 @@ st.markdown(
 )
 
 # ============================================================================
-# UPDATED TAXONOMY MAPPING
+# TAXONOMY MAPPING (INCLUDING SUNSTROKE)
 # ============================================================================
 
 TAXONOMY_RULES = {
-    # 1. Physical Violence & Assaults
+    # Sunstroke & Heat Emergency
+    "sunstroke_heat_exhaustion": {
+        "category": "Heat Emergencies & Insolation",
+        "ar": "ضربة شمس وإجهاد حراري حاد",
+        "en": "sunstroke_heat_exhaustion",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "☀️",
+        "action": "نقل المصاب لمظلة تبريد فوراً ورش الماء ونقله للإسعاف",
+    },
+
+    # Physical Violence & Assaults
     "fighting": {
         "category": "Physical Violence & Assaults",
         "ar": "شجار واشتباك جسدي",
@@ -130,7 +138,7 @@ TAXONOMY_RULES = {
         "action": "توجيه دورية أمن الميدان فوراً لفض الاشتباك",
     },
 
-    # 2. Falls & Complex Medical Emergencies
+    # Falls & Complex Medical Emergencies
     "sudden_fall": {
         "category": "Falls & Complex Medical Emergencies",
         "ar": "سقوط مفاجئ وفقدان فوري للتوازن",
@@ -158,33 +166,6 @@ TAXONOMY_RULES = {
         "icon": "⚡",
         "action": "تأمين محيط المصاب وحماية الرأس وتوجيه إسعاف عاجل",
     },
-    "slow_fall_followed_by_seizure": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "سقوط بطيء متبوع بنوبة تشنج/صرع",
-        "en": "slow_fall_followed_by_seizure",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "⚡",
-        "action": "توجيه العناية المركزة الميدانية مباشرة",
-    },
-    "slow_fall_followed_by_opisthotonos": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "سقوط بطيء متبوع بتشنج ظهري (Opisthotonos)",
-        "en": "slow_fall_followed_by_opisthotonos",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "☣️",
-        "action": "تثبيت العمود الفقري واستدعاء الطبيب المناظر",
-    },
-    "rolling_and_severe_coughing": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "تدحرج على الأرض وسعال حاد",
-        "en": "rolling_and_severe_coughing",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "🫁",
-        "action": "توفير قناع أكسجين وتأمين مجرى التنفس",
-    },
     "lying_immobile": {
         "category": "Falls & Complex Medical Emergencies",
         "ar": "استلقاء وسقوط بدون حركة (فقدان وعي)",
@@ -195,7 +176,7 @@ TAXONOMY_RULES = {
         "action": "توجيه فريق الإنعاش القلبي الرئوي",
     },
 
-    # 3. Abnormal Gait & Physical Fatigue
+    # Abnormal Gait & Physical Fatigue
     "regular_limping": {
         "category": "Abnormal Gait & Fatigue",
         "ar": "عرج منتظم (خطوات متشابهة ومتكررة)",
@@ -223,62 +204,6 @@ TAXONOMY_RULES = {
         "icon": "😫",
         "action": "تقديم السوائل ونقل المصاب لمنطقة التبريد",
     },
-    "arm_injury": {
-        "category": "Abnormal Gait & Fatigue",
-        "ar": "إصابة والتواء في الذراع / اليد",
-        "en": "arm_injury",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🩹",
-        "action": "توجيه حقيبة إسعافات أولية لتثبيت الذراع",
-    },
-
-    # 4. Fast Movement & Dynamic Activities
-    "rapid_breathing": {
-        "category": "Dynamic Activities & Respiration",
-        "ar": "نهث وتسارع غير طبيعي في التنفس",
-        "en": "rapid_breathing",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🫀",
-        "action": "تهدئة المصاب وقياس نسبة تشبع الأكسجين",
-    },
-    "running_sprinting": {
-        "category": "Dynamic Activities & Respiration",
-        "ar": "جري وركض سريع في المسار",
-        "en": "running_sprinting",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "🏃",
-        "action": "مراقبة التدفق لمنع التدافع العشوائي",
-    },
-    "jumping": {
-        "category": "Dynamic Activities & Respiration",
-        "ar": "قفز حركي متكرر",
-        "en": "jumping",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "🦘",
-        "action": "مراقبة اعتيادية",
-    },
-    "dancing": {
-        "category": "Dynamic Activities & Respiration",
-        "ar": "حركات رقص أو استعراض",
-        "en": "dancing",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "💃",
-        "action": "مراقبة اعتيادية",
-    },
-    "situps_exercise": {
-        "category": "Dynamic Activities & Respiration",
-        "ar": "تمارين بدنية أرضية (Sit-ups)",
-        "en": "situps_exercise",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "🧘",
-        "action": "مراقبة اعتيادية",
-    },
 }
 
 PRIORITY_COLOR = {"Critical": "#DC2626", "High": "#F97316", "Medium": "#F59E0B", "Low": "#3B82F6"}
@@ -291,7 +216,7 @@ LOCATIONS = [
 ]
 
 # ============================================================================
-# DATA STRUCTURES
+# DATA STRUCTURES & TRACKING
 # ============================================================================
 
 @dataclass
@@ -324,7 +249,7 @@ class Track:
 
 def extract_features(track: Track):
     hist = list(track.history)
-    if len(hist) < 5:
+    if len(hist) < 4:
         return None
 
     heights = [h["b"][3] for h in hist]
@@ -360,39 +285,34 @@ def extract_features(track: Track):
 def classify_taxonomy(f: dict, sensitivity: int):
     s = sensitivity / 100.0
 
-    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.28 * (1.1 - 0.3 * s)) or (
-        f["aspect_prev"] < 0.90 and f["aspect_curr"] > 1.10
-    ):
+    # 1. رصد ضربة الشمس (Sunstroke): مشي بطيء جداً، ترنح خفيف، وانحناء قليل في البنية
+    if f["speed_mean"] < 0.015 and 0.015 < f["speed_jitter"] < 0.04 and f["aspect_curr"] > 0.6:
+        return "sunstroke_heat_exhaustion", min(0.96, 0.75 + 0.2 * s)
+
+    # 2. رصد السقوط المفاجئ والتشنج
+    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.25 * (1.1 - 0.3 * s)):
         if f["speed_jitter"] > 0.03:
             return "sudden_fall_followed_by_seizure", min(0.98, 0.80 + 0.15 * s)
         return "sudden_fall", min(0.95, 0.78 + 0.18 * s)
 
-    if 0.18 < f["h_drop"] <= 0.28 and f["aspect_curr"] > 0.95:
-        if f["speed_jitter"] > 0.03:
-            return "slow_fall_followed_by_seizure", min(0.94, 0.75 + 0.18 * s)
-        return "slow_fall", min(0.91, 0.65 + 0.2 * s)
+    # 3. الاستلقاء بدون حركة
+    if f["aspect_curr"] > 1.10 and f["displacement"] < 0.20:
+        return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
 
-    prone = f["aspect_curr"] > 1.10
-    if prone and f["displacement"] < 0.20:
-        if f["speed_jitter"] < 0.015:
-            return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
-        elif f["speed_jitter"] > 0.04:
-            return "rolling_and_severe_coughing", min(0.93, 0.70 + 0.2 * s)
-
-    if not prone and f["speed_jitter"] > 0.04 * (1.1 - 0.2 * s):
-        if f["speed_jitter"] > 0.08:
+    # 4. العرج والإجهاد
+    if f["speed_jitter"] > 0.035:
+        if f["speed_jitter"] > 0.07:
             return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 3.0)
-        else:
-            return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 3.5)
+        return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 3.5)
 
-    if not prone and f["speed_mean"] < 0.03 and f["h_drop"] > 0.10:
+    if f["speed_mean"] < 0.03 and f["h_drop"] > 0.08:
         return "Exhausted_walking", min(0.85, 0.60 + 0.2 * s)
 
     return None, 0.0
 
 
 # ============================================================================
-# OPENCV MOTION & TRACKING ENGINE
+# OPENCV ENGINE
 # ============================================================================
 
 def new_state():
@@ -405,35 +325,37 @@ def new_state():
 
 
 def process_video_frame(frame, frame_idx, state, sensitivity):
+    canvas = frame.copy()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (21, 21), 0)
 
     if state["prev_gray"] is None:
         state["prev_gray"] = gray
-        return frame.copy(), [], 0
+        return canvas, [], 1
 
     frame_diff = cv2.absdiff(state["prev_gray"], gray)
     state["prev_gray"] = gray
 
-    _, thresh = cv2.threshold(frame_diff, 20, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(frame_diff, 15, 255, cv2.THRESH_BINARY)
     thresh = cv2.dilate(thresh, None, iterations=2)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detections = []
     for c in contours:
-        if cv2.contourArea(c) < 800:
+        if cv2.contourArea(c) < 400:
             continue
         x, y, w, h = cv2.boundingRect(c)
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h)))
 
+    # ضامن التتبع لضمان استمرار تحرك البث حتى مع بطء الحركة
     if not detections:
-        h, w, _ = frame.shape
-        detections.append(((w / 2, h / 2), (int(w * 0.35), int(h * 0.2), int(w * 0.3), int(h * 0.6))))
+        h_f, w_f, _ = frame.shape
+        detections.append(((w_f / 2, h_f / 2), (int(w_f * 0.35), int(h_f * 0.2), int(w_f * 0.3), int(h_f * 0.6))))
 
     assigned = set()
     for (cx, cy), (x, y, w, h) in detections:
-        best_id, best_d = None, 150.0
+        best_id, best_d = None, 180.0
         for tid, tr in state["tracks"].items():
             if tid in assigned:
                 continue
@@ -452,7 +374,6 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
     for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 15]:
         del state["tracks"][tid]
 
-    canvas = frame.copy()
     new_alerts = []
     active_count = 0
 
@@ -460,96 +381,33 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
         active_count += 1
         x, y, w, h = tr.bbox
         f = extract_features(tr)
-        
-        is_abnormal = False
-        tag = f"ID {tid} - Normal"
-        color = (0, 255, 0) # أخضر للحالة الطبيعية
 
+        is_abnormal = False
         if f:
             cond, conf = classify_taxonomy(f, sensitivity)
             if cond and cond in TAXONOMY_RULES:
                 is_abnormal = True
                 info = TAXONOMY_RULES[cond]
-                color = (0, 0, 255) # أحمر عند اكتشاف Abnormal
-                tag = f"⚠️ ABNORMAL: {info['ar']} ({conf*100:.0f}%)"
+                color = (0, 0, 255) # أحمر بارز للحالات الحرجة
+                tag = f"⚠️ {info['ar']} ({conf*100:.0f}%)"
 
                 last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 180:
+                if frame_idx - last_f > 120:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
 
-        # رسم Bounding Box بارز وأحمر فقط على الموقع المرصود بـ Abnormal
+        # رسم Bounding Box بارز وأحمر حصرًا عند رصد حالة Abnormal
         if is_abnormal:
             cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 3)
-            (text_w, text_h), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            (text_w, text_h), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
             cv2.rectangle(canvas, (x, max(y - 25, 0)), (x + text_w + 10, max(y, 25)), color, -1)
-            cv2.putText(canvas, tag, (x + 5, max(y - 7, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-        else:
-            cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 1)
+            cv2.putText(canvas, tag, (x + 5, max(y - 7, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
 
     return canvas, new_alerts, active_count
 
-# ============================================================================
-# SYNTHETIC SIMULATION PIPELINE
-# ============================================================================
-
-def process_sim(frame_idx, state, sensitivity, w, h):
-    phases = ["normal_walk", "regular_limping", "Exhausted_walking", "sudden_fall_followed_by_seizure", "lying_immobile"]
-    p_len = 65
-    p_idx = (frame_idx % (p_len * len(phases))) // p_len
-    phase = phases[p_idx]
-    t = (frame_idx % p_len) / p_len
-    ground = h - 60
-
-    if phase == "normal_walk":
-        bw, bh = 46, 125
-        cx, cy = w * 0.2 + t * w * 0.4, ground - bh / 2
-    elif phase == "regular_limping":
-        bw, bh = 50, 120
-        cx, cy = w * 0.6 + math.sin(t * 18) * 12, ground - bh / 2
-    elif phase == "Exhausted_walking":
-        bw, bh = 54, 100
-        cx, cy = w * 0.65, ground - bh / 2
-    elif phase == "sudden_fall_followed_by_seizure":
-        c = min(1.0, t / 0.32)
-        bw, bh = 50 + c * 70, 120 - c * 90
-        cx, cy = w * 0.65, ground - bh / 2
-    else:
-        bw, bh = 125, 30
-        cx, cy = w * 0.65, ground - 16
-
-    canvas = np.full((h, w, 3), (11, 19, 43), dtype=np.uint8)
-    cv2.line(canvas, (0, ground), (w, ground), (58, 80, 107), 2)
-    cv2.ellipse(canvas, (int(cx), int(cy)), (max(int(bw / 2), 6), max(int(bh / 2), 6)), 0, 0, 360, (144, 224, 239), -1)
-
-    tid = 1
-    if tid not in state["tracks"]:
-        state["tracks"][tid] = Track(tid, (cx, cy), (cx - bw / 2, cy - bh / 2, bw, bh), frame_idx)
-    else:
-        state["tracks"][tid].update((cx, cy), (cx - bw / 2, cy - bh / 2, bw, bh), frame_idx)
-
-    feats = extract_features(state["tracks"][tid])
-    new_alerts = []
-    color, tag = (40, 200, 100), "Normal: 0"
-
-    if feats:
-        cond, conf = classify_taxonomy(feats, sensitivity)
-        if cond and cond in TAXONOMY_RULES:
-            color = (40, 40, 235)
-            tag = f"Abnormal: {TAXONOMY_RULES[cond]['en']}"
-            last_f = state["global_cd"].get(cond, -9999)
-            if frame_idx - last_f > 150:
-                state["global_cd"][cond] = frame_idx
-                new_alerts.append((cond, conf))
-
-    x, y = int(cx - bw / 2), int(cy - bh / 2)
-    cv2.rectangle(canvas, (x, y), (x + int(bw), y + int(bh)), color, 2)
-    cv2.putText(canvas, tag, (x, max(y - 8, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
-    return canvas, new_alerts, 1
-
 
 # ============================================================================
-# STATE & UI MANAGEMENT
+# STREAMLIT UI & CONTROL
 # ============================================================================
 
 if "alerts" not in st.session_state:
@@ -576,20 +434,18 @@ with st.sidebar:
 
     feed_mode = st.radio(
         "مصدر البث (Feed Source)",
-        ["وضع المحاكاة التفاعلي (Simulation Mode)", "رفع فيديو مراقبة (Upload Video)"],
+        ["رفع فيديو مراقبة (Upload Video)"],
     )
 
-    uploaded_vid = None
-    if feed_mode == "رفع فيديو مراقبة (Upload Video)":
-        uploaded_vid = st.file_uploader("اختر مقطع الكاميرا (.mp4)", type=["mp4", "avi", "mov"])
+    uploaded_vid = st.file_uploader("اختر مقطع الكاميرا (.mp4)", type=["mp4", "avi", "mov"])
 
     st.markdown("---")
     selected_zone = st.selectbox("نطاق الكاميرا والموقع (Zone)", LOCATIONS)
-    sens = st.slider("حساسية الرصد والاستجابة (Sensitivity)", 20, 100, 60)
+    sens = st.slider("حساسية الرصد والاستجابة (Sensitivity)", 20, 100, 70)
 
     st.markdown("---")
     play_speed = st.slider("معدل العرض (FPS)", 6, 30, 16)
-    max_f = st.slider("إجمالي الإطارات للفحص (Max Frames)", 80, 800, 320, step=20)
+    max_f = st.slider("إجمالي الإطارات للفحص (Max Frames)", 80, 1000, 400, step=20)
 
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -633,7 +489,6 @@ def draw_triage_html():
     for idx, a in enumerate(reversed(st.session_state.alerts)):
         info = TAXONOMY_RULES.get(a.condition_key, TAXONOMY_RULES["sudden_fall"])
         b_color = PRIORITY_COLOR[info["priority"]]
-        dispatch_status = "✅ تم توجيه الفرقة" if a.dispatched else "⚠️ قيد الانتظار"
 
         html_out += f"""
         <div class="alert-card" style="border-left: 6px solid {b_color};">
@@ -646,55 +501,45 @@ def draw_triage_html():
             <div class="card-en"><b>Class:</b> <code>{info['en']}</code> (الثقة: {a.confidence*100:.0f}%)</div>
             <div class="card-meta">📍 {a.location}</div>
             <div style="margin-top:0.4rem; font-size:0.8rem; color:#CBD5E1;"><b>الإجراء الموصى به:</b> {info['action']}</div>
-            <div style="margin-top:0.5rem; font-size:0.85rem; font-weight:bold; color:#38BDF8;">الحالة: {dispatch_status}</div>
         </div>
         """
     return html_out
 
 
 def run_detection():
+    if uploaded_vid is None:
+        st.warning("الرجاء رفع ملف فيديو أولاً لتشغيل البث.")
+        return
+
     st.session_state.alerts = []
     state = new_state()
-    is_sim = feed_mode.startswith("وضع المحاكاة")
-    tfile_path = None
 
-    if is_sim:
-        w, h, cap, fps_src, total_frames = 640, 400, None, 25.0, max_f
-    else:
-        if uploaded_vid is None:
-            st.warning("الرجاء رفع ملف فيديو أولاً.")
-            return
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tf.write(uploaded_vid.read())
+    tfile_path = tf.name
+    tf.close()
 
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tf.write(uploaded_vid.read())
-        tfile_path = tf.name
-        tf.close()
-
-        cap = cv2.VideoCapture(tfile_path)
-        fps_src = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        v_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max_f
-        total_frames = min(max_f, v_total)
-        w, h = 640, 400
+    cap = cv2.VideoCapture(tfile_path)
+    fps_src = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    v_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max_f
+    total_frames = min(max_f, v_total)
+    w, h = 640, 400
 
     start_t = time.time()
     frame_idx = 0
     proc = 0
-
     target_delay = 1.0 / play_speed
 
     while proc < total_frames:
         loop_start = time.time()
         frame_idx += 1
 
-        if is_sim:
-            frame_bgr, evts, tracks = process_sim(frame_idx, state, sens, w, h)
-        else:
-            ok, raw = cap.read()
-            if not ok:
-                break
+        ok, raw = cap.read()
+        if not ok:
+            break
 
-            raw = cv2.resize(raw, (w, h))
-            frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, state, sens)
+        raw = cv2.resize(raw, (w, h))
+        frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, state, sens)
 
         for cond, conf in evts:
             seq_num = len(st.session_state.alerts) + 1
@@ -732,9 +577,8 @@ def run_detection():
         if sleep_time > 0:
             time.sleep(sleep_time)
 
-    if cap:
-        cap.release()
-    if tfile_path and os.path.exists(tfile_path):
+    cap.release()
+    if os.path.exists(tfile_path):
         try:
             os.remove(tfile_path)
         except Exception:
