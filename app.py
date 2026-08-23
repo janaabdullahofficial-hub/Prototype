@@ -1,10 +1,6 @@
 """
 نظام بصير للرصد والفرز الإسعافي والأمني المبكر
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
-========================================================================
-- Complete 22-Class Taxonomy Architecture
-- Zero Key Collision Guarantee (Unique Enumerated Keys)
-- Anti-Ghosting / Clutter-Free Spatial Filtering
 """
 
 import math
@@ -14,14 +10,13 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 import cv2
 import numpy as np
 import streamlit as st
 
 # ============================================================================
-# PAGE CONFIG & COMMAND CENTER THEME
+# PAGE CONFIG & MODERN COMMAND CENTER THEME
 # ============================================================================
 
 st.set_page_config(
@@ -127,31 +122,19 @@ st.markdown(
 )
 
 # ============================================================================
-# EXACT 22-CLASS TAXONOMY MAPPING
+# MEDICAL & BEHAVIORAL TAXONOMY (WITH HEATSTROKE AS CORE TRIAGE)
 # ============================================================================
 
 TAXONOMY_RULES = {
-    # 1. Physical Violence & Assaults
-    "boxing_fighting": {
-        "category": "Physical Violence & Assaults",
-        "ar": "مضاربة كيك بوكسنغ واعتداء جسدي",
-        "en": "boxing_fighting",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "🥊",
-        "action": "توجيه دورية أمن الميدان فوراً لفض الاشتباك",
+    "heatstroke_exhaustion": {
+        "category": "Medical & Respiratory Distress",
+        "ar": "ضربة شمس حادة / إجهاد حراري وهبوط عام",
+        "en": "heatstroke_exhaustion",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "☀️",
+        "action": "توجيه فرقة إسعافية فورية مع معدات التبريد ومحاليل الإرواء",
     },
-    "kicking_assault": {
-        "category": "Physical Violence & Assaults",
-        "ar": "مضاربة واعتداء بالركل",
-        "en": "kicking_assault",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "🥋",
-        "action": "توجيه الأمن الميداني وتأمين المارة",
-    },
-
-    # 2. Falls & Abnormal Locomotion
     "sudden_fall": {
         "category": "Falls & Abnormal Locomotion",
         "ar": "سقوط مفاجئ وفقدان فوري للتوازن",
@@ -159,61 +142,25 @@ TAXONOMY_RULES = {
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "🚨",
-        "action": "توجيه فرقة الإنعاش القلبي والتدخل السريع",
+        "action": "توجيه فرقة الإنعاش القلبي والتدخل السريع فوراً",
     },
     "slow_fall": {
         "category": "Falls & Abnormal Locomotion",
-        "ar": "سقوط بطيء وتدريجي (هبوط إعياء)",
+        "ar": "سقوط بطيء وتدريجي (هبوط إعياء حاد)",
         "en": "slow_fall",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "⬇️",
-        "action": "فحص العلامات الحيوية ونقل المصاب للتبريد",
-    },
-    "fall_and_recovery": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "تعثر وسقوط مع محاولة النهوض",
-        "en": "fall_and_recovery",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🔄",
-        "action": "المراقبة البصرية ومساندة الحركة",
+        "action": "فحص العلامات الحيوية ونقل المصاب لمنطقة مظللة",
     },
     "severe_gait_limping": {
         "category": "Falls & Abnormal Locomotion",
-        "ar": "عرج شديد ومطرد (إجهاد حاد)",
+        "ar": "عرج شديد ومطرد / بوادر ضربة شمس وجفاف",
         "en": "severe_gait_limping",
         "priority": "High",
         "color": "#F97316",
         "icon": "🚶",
-        "action": "توجيه كرسي إسعافي متحرك لنقل المصاب",
-    },
-    "irregular_limping": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "عرج خفيف غير منتظم",
-        "en": "irregular_limping",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "👣",
-        "action": "تنبيه نقطة الرعاية الميدانية القريبة",
-    },
-    "crawling_on_floor": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "زحف كامل على الأرض وعدم قدرة على الوقوف",
-        "en": "crawling_on_floor",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "🚷",
-        "action": "إرسال نقالة طبية عاجلة لمنع الدهس",
-    },
-    "crawling_exhausted": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "حبـو وإجهاد بدني شديد من التعب",
-        "en": "crawling_exhausted",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "🧎",
-        "action": "توجيه مسعف مباشر لتزويده بالسوائل",
+        "action": "توجيه كرسي إسعافي متحرك ومسعف راجل للتقييم",
     },
     "stooped_walking_resting": {
         "category": "Falls & Abnormal Locomotion",
@@ -222,36 +169,16 @@ TAXONOMY_RULES = {
         "priority": "High",
         "color": "#F97316",
         "icon": "🧍",
-        "action": "نقل المصاب إلى مظلة رعاية وتفقد الضغط",
+        "action": "نقل المصاب إلى مظلة رعاية وتفقد الضغط والسكر",
     },
-    "arm_injury": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "إصابة والتواء في الذراع / اليد",
-        "en": "arm_injury",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🩹",
-        "action": "توجيه حقيبة إسعافات أولية لتثبيت الذراع",
-    },
-
-    # 3. Medical & Respiratory Distress
     "severe_choking_on_ground": {
         "category": "Medical & Respiratory Distress",
-        "ar": "اختناق وسعال حاد مع استلقاء على الأرض",
+        "ar": "استلقاء أرضي ممتد مع اضطراب تنفسي",
         "en": "severe_choking_on_ground",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "🫁",
         "action": "تأمين مجرى التنفس والتدخل الإسعافي الفوري",
-    },
-    "choking_cough": {
-        "category": "Medical & Respiratory Distress",
-        "ar": "كحة واختناق ناتج عن الأدخنة أو الغبار",
-        "en": "choking_cough",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "💨",
-        "action": "توفير قناع أكسجين ونقل المصاب لمنطقة مهواة",
     },
     "seizure_convulsion": {
         "category": "Medical & Respiratory Distress",
@@ -260,19 +187,8 @@ TAXONOMY_RULES = {
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "⚡",
-        "action": "حماية رأس المصاب وتأمين المحيط فوراً",
+        "action": "حماية رأس المصاب وتأمين المحيط لمنع التدافع",
     },
-    "rapid_breathing": {
-        "category": "Medical & Respiratory Distress",
-        "ar": "نهث وتسارع غير طبيعي في التنفس",
-        "en": "rapid_breathing",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🫀",
-        "action": "تهدئة المصاب وقياس نسبة تشبع الأكسجين",
-    },
-
-    # 4. Fast Movement & Dynamic Activities
     "running_sprinting": {
         "category": "Fast Movement & Dynamic Activities",
         "ar": "جري وركض سريع في المسار",
@@ -280,63 +196,7 @@ TAXONOMY_RULES = {
         "priority": "Low",
         "color": "#3B82F6",
         "icon": "🏃",
-        "action": "مراقبة التدفق لمنع التدافع العشوائي",
-    },
-    "jogging": {
-        "category": "Fast Movement & Dynamic Activities",
-        "ar": "هرولة اعتيادية",
-        "en": "jogging",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "🏃",
-        "action": "مراقبة اعتيادية",
-    },
-    "jumping": {
-        "category": "Fast Movement & Dynamic Activities",
-        "ar": "قفز حركي متكرر",
-        "en": "jumping",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "🦘",
-        "action": "مراقبة اعتيادية",
-    },
-    "dancing": {
-        "category": "Fast Movement & Dynamic Activities",
-        "ar": "حركات رقص أو استعراض",
-        "en": "dancing",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "💃",
-        "action": "مراقبة اعتيادية",
-    },
-    "situps_exercise": {
-        "category": "Fast Movement & Dynamic Activities",
-        "ar": "تمرين الـ Situp / تمارين بدنية أرضية",
-        "en": "situps_exercise",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "🧘",
-        "action": "مراقبة اعتيادية",
-    },
-
-    # 5. Object Interaction & Environmental Events
-    "bag_throwing_airborne": {
-        "category": "Object Interaction & Events",
-        "ar": "طيران الشنطة / قذف حقيبة في الهواء",
-        "en": "bag_throwing_airborne",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🎒",
-        "action": "فحص أمني فوري لموقع الحقيبة",
-    },
-    "flying_papers": {
-        "category": "Object Interaction & Events",
-        "ar": "تطاير أوراق أو أجسام خفيفة مع الرياح",
-        "en": "flying_papers",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "📄",
-        "action": "تنبيه فرق النظافة والصيانة الميدانية",
+        "action": "مراقبة تدفق الحشود وتفادي التدافع",
     },
 }
 
@@ -369,7 +229,7 @@ class Alert:
 class Track:
     def __init__(self, track_id, centroid, bbox, frame_idx):
         self.id = track_id
-        self.history = deque(maxlen=45)
+        self.history = deque(maxlen=50)
         self.age = 0
         self.update(centroid, bbox, frame_idx)
 
@@ -383,7 +243,7 @@ class Track:
 
 def extract_features(track: Track):
     hist = list(track.history)
-    if len(hist) < 8:
+    if len(hist) < 6:
         return None
 
     heights = [h["b"][3] for h in hist]
@@ -420,42 +280,44 @@ def classify_taxonomy(f: dict, sensitivity: int):
     s = sensitivity / 100.0
 
     # 1. Sudden Fall vs Slow Fall
-    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.32 * (1.1 - 0.3 * s)) or (
-        f["aspect_prev"] < 0.90 and f["aspect_curr"] > 1.12 and f["max_vert_v"] > 0.05
+    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.28 * (1.1 - 0.3 * s)) or (
+        f["aspect_prev"] < 0.92 and f["aspect_curr"] > 1.10
     ):
-        return "sudden_fall", min(0.98, 0.78 + 0.18 * s)
+        return "sudden_fall", min(0.98, 0.80 + 0.18 * s)
 
-    if 0.22 < f["h_drop"] <= 0.32 and f["aspect_curr"] > 1.0:
-        return "slow_fall", min(0.91, 0.65 + 0.2 * s)
+    if 0.18 < f["h_drop"] <= 0.28 and f["aspect_curr"] > 1.0:
+        return "slow_fall", min(0.92, 0.68 + 0.2 * s)
 
     # 2. Prolonged Ground Immobilization & Seizures
-    prone = f["aspect_curr"] > 1.15
-    if prone and f["displacement"] < 0.18:
+    prone = f["aspect_curr"] > 1.10
+    if prone and f["displacement"] < 0.20:
         if f["speed_jitter"] > 0.04:
             return "seizure_convulsion", min(0.95, 0.72 + 0.2 * s)
         return "severe_choking_on_ground", min(0.92, 0.68 + 0.2 * s)
 
-    # 3. Stooped Walking / Rest
-    if 0.15 < f["h_drop"] <= 0.28 and f["aspect_curr"] < 1.05:
-        return "stooped_walking_resting", min(0.86, 0.55 + f["h_drop"] * 0.7)
+    # 3. Heatstroke & Gait Instability
+    if not prone and f["speed_jitter"] > 0.032 * (1.1 - 0.3 * s):
+        if f["h_drop"] > 0.10:
+            return "heatstroke_exhaustion", min(0.94, 0.70 + f["speed_jitter"] * 4.0)
+        return "severe_gait_limping", min(0.88, 0.58 + f["speed_jitter"] * 4.0)
 
-    # 4. Gait Limping
-    if not prone and f["speed_jitter"] > 0.042 * (1.1 - 0.3 * s):
-        return "severe_gait_limping", min(0.88, 0.55 + f["speed_jitter"] * 4.0)
+    # 4. Stooped Walking / Resting
+    if 0.12 < f["h_drop"] <= 0.28 and f["aspect_curr"] < 1.05:
+        return "stooped_walking_resting", min(0.86, 0.58 + f["h_drop"] * 0.7)
 
     return None, 0.0
 
 
 # ============================================================================
-# OPENCV ENGINE (ANTI-CLUTTER FILTERED)
+# OPENCV ENGINE
 # ============================================================================
 
 def new_state():
-    bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+    bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=45, detectShadows=False)
     return {"bg": bg, "tracks": {}, "next_id": 1, "global_cd": {}}
 
 
-def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
+def process_video_frame(frame, frame_idx, state, sensitivity, min_area=2000):
     kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
 
@@ -472,11 +334,10 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
         if area < min_area:
             continue
         x, y, w, h = cv2.boundingRect(c)
-        if w < 30 or h < 30:
+        if w < 25 or h < 25:
             continue
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h), area))
 
-    # Keep top 2 largest candidates to isolate true human targets
     detections = sorted(detections, key=lambda d: d[2], reverse=True)[:2]
 
     assigned = set()
@@ -497,7 +358,6 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
             state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
             assigned.add(tid)
 
-    # Prune stale tracks
     for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 12]:
         del state["tracks"][tid]
 
@@ -506,7 +366,7 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
     active_count = 0
 
     for tid, tr in state["tracks"].items():
-        if tr.last_seen != frame_idx or tr.age < 8:
+        if tr.last_seen != frame_idx or tr.age < 5:
             continue
 
         active_count += 1
@@ -522,7 +382,7 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
                 tag = f"Abnormal: {info['en']}"
 
                 last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 130:
+                if frame_idx - last_f > 95:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
             elif f["speed_jitter"] > 0.025:
@@ -535,61 +395,93 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
 
 
 # ============================================================================
-# SYNTHETIC SIMULATION PIPELINE
+# SYNTHETIC SIMULATION PIPELINE (WITH HEATSTROKE DEMO)
 # ============================================================================
 
 def process_sim(frame_idx, state, sensitivity, w, h):
-    phases = ["normal_walk", "severe_gait_limping", "stooped_walking_resting", "sudden_fall", "severe_choking_on_ground"]
-    p_len = 65
-    p_idx = (frame_idx % (p_len * len(phases))) // p_len
-    phase = phases[p_idx]
-    t = (frame_idx % p_len) / p_len
-    ground = h - 60
+    phases = [
+        ("Normal Walk", "normal_walk", 50),
+        ("Severe Heatstroke Symptoms", "heatstroke_exhaustion", 65),
+        ("Pre-Collapse Stoop", "stooped_walking_resting", 55),
+        ("Sudden Fall Event", "sudden_fall", 50),
+        ("Immobilized on Ground", "severe_choking_on_ground", 65),
+    ]
+    
+    total_cycle = sum(p[2] for p in phases)
+    curr_t = frame_idx % total_cycle
+    
+    accum = 0
+    curr_phase_name = "Normal Walk"
+    curr_cond = "normal_walk"
+    phase_progress = 0.0
+    
+    for name, cond, duration in phases:
+        if accum <= curr_t < accum + duration:
+            curr_phase_name = name
+            curr_cond = cond
+            phase_progress = (curr_t - accum) / duration
+            break
+        accum += duration
 
-    if phase == "normal_walk":
-        bw, bh = 46, 125
-        cx, cy = w * 0.2 + t * w * 0.4, ground - bh / 2
-    elif phase == "severe_gait_limping":
-        bw, bh = 50, 120
-        cx, cy = w * 0.6 + math.sin(t * 22) * 16, ground - bh / 2
-    elif phase == "stooped_walking_resting":
-        bw, bh = 56 + t * 15, 120 - t * 45
-        cx, cy = w * 0.65, ground - bh / 2
-    elif phase == "sudden_fall":
-        c = min(1.0, t / 0.32)
-        bw, bh = 50 + c * 70, 120 - c * 90
-        cx, cy = w * 0.65, ground - bh / 2
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    canvas[:] = (15, 23, 42)
+    
+    ground_y = h - 70
+    cv2.line(canvas, (0, ground_y), (w, ground_y), (51, 65, 85), 3)
+
+    if curr_cond == "normal_walk":
+        bw, bh = 48, 140
+        cx = int(w * 0.2 + phase_progress * w * 0.3)
+        cy = int(ground_y - bh / 2)
+    elif curr_cond == "heatstroke_exhaustion":
+        bw, bh = 54, int(135 - phase_progress * 15)
+        cx = int(w * 0.5 + math.sin(phase_progress * 20) * 16)
+        cy = int(ground_y - bh / 2)
+    elif curr_cond == "stooped_walking_resting":
+        bw, bh = int(55 + phase_progress * 20), int(120 - phase_progress * 40)
+        cx = int(w * 0.55)
+        cy = int(ground_y - bh / 2)
+    elif curr_cond == "sudden_fall":
+        fall_t = min(1.0, phase_progress / 0.4)
+        bw = int(55 + fall_t * 85)
+        bh = int(120 - fall_t * 90)
+        cx = int(w * 0.58)
+        cy = int(ground_y - bh / 2)
     else:
-        bw, bh = 125, 30
-        cx, cy = w * 0.65, ground - 16
+        bw, bh = 140, 32
+        cx = int(w * 0.58)
+        cy = int(ground_y - 18)
 
-    canvas = np.full((h, w, 3), (11, 19, 43), dtype=np.uint8)
-    cv2.line(canvas, (0, ground), (w, ground), (58, 80, 107), 2)
-    cv2.ellipse(canvas, (int(cx), int(cy)), (max(int(bw / 2), 6), max(int(bh / 2), 6)), 0, 0, 360, (144, 224, 239), -1)
+    cv2.ellipse(canvas, (cx, cy), (max(int(bw / 2), 6), max(int(bh / 2), 6)), 0, 0, 360, (56, 189, 248), -1)
+    if bh > 40:
+        cv2.circle(canvas, (cx, cy - int(bh / 2) + 12), 14, (125, 211, 252), -1)
 
+    bbox = (cx - bw / 2, cy - bh / 2, bw, bh)
     tid = 1
     if tid not in state["tracks"]:
-        state["tracks"][tid] = Track(tid, (cx, cy), (cx - bw / 2, cy - bh / 2, bw, bh), frame_idx)
+        state["tracks"][tid] = Track(tid, (cx, cy), bbox, frame_idx)
     else:
-        state["tracks"][tid].update((cx, cy), (cx - bw / 2, cy - bh / 2, bw, bh), frame_idx)
+        state["tracks"][tid].update((cx, cy), bbox, frame_idx)
 
     feats = extract_features(state["tracks"][tid])
     new_alerts = []
-    color, tag = (40, 200, 100), "Normal: 0"
+    box_color, tag = (40, 200, 100), "ID 1 - Normal (0)"
 
     if feats:
         cond, conf = classify_taxonomy(feats, sensitivity)
         if cond and cond in TAXONOMY_RULES:
-            color = (40, 40, 235)
+            box_color = (40, 40, 235)
             tag = f"Abnormal: {TAXONOMY_RULES[cond]['en']}"
             last_f = state["global_cd"].get(cond, -9999)
-            if frame_idx - last_f > 85:
+            if frame_idx - last_f > 65:
                 state["global_cd"][cond] = frame_idx
                 new_alerts.append((cond, conf))
 
     x, y = int(cx - bw / 2), int(cy - bh / 2)
-    cv2.rectangle(canvas, (x, y), (x + int(bw), y + int(bh)), color, 2)
-    cv2.putText(canvas, tag, (x, max(y - 8, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
+    cv2.rectangle(canvas, (x, y), (x + int(bw), y + int(bh)), box_color, 2)
+    cv2.putText(canvas, tag, (x, max(y - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2, cv2.LINE_AA)
+    cv2.putText(canvas, f"SIMULATION: {curr_phase_name}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (148, 163, 184), 1, cv2.LINE_AA)
+
     return canvas, new_alerts, 1
 
 
@@ -609,7 +501,7 @@ st.markdown(
     <div class="header-box">
         <div>
             <div class="system-title">🚑 نظام بصير | AI Anomaly Detection & Triage</div>
-            <div class="system-sub">منظومة الرصد والفرز الذكي للمؤشرات الحيوية والحركية وفق معيار التصنيف المعتمد (22 Class Taxonomy)</div>
+            <div class="system-sub">منظومة الرصد والفرز الذكي للمؤشرات الحيوية والحركية وإدارة بلاغات ضربات الشمس والسقوط</div>
         </div>
         <div class="live-badge">● LIVE DISPATCH SYSTEM</div>
     </div>
@@ -621,22 +513,23 @@ with st.sidebar:
     st.markdown("### 🎛️ غرفة العمليات والتحكم")
     st.caption("Operations & Taxonomy Control Hub")
 
-    feed_mode = st.radio(
+    mode_choice = st.radio(
         "مصدر البث (Feed Source)",
-        ["وضع المحاكاة التفاعلي (Simulation Mode)", "رفع فيديو مراقبة (Upload Video)"],
+        ["Simulation", "Upload Video"],
+        format_func=lambda x: "وضع المحاكاة التفاعلي (Simulation Mode)" if x == "Simulation" else "رفع فيديو مراقبة (Upload Video)",
     )
 
     uploaded_vid = None
-    if feed_mode == "رفع فيديو مراقبة (Upload Video)":
+    if mode_choice == "Upload Video":
         uploaded_vid = st.file_uploader("اختر مقطع الكاميرا (.mp4)", type=["mp4", "avi", "mov"])
 
     st.markdown("---")
     selected_zone = st.selectbox("نطاق الكاميرا والموقع (Zone)", LOCATIONS)
-    sens = st.slider("حساسية الرصد والاستجابة (Sensitivity)", 20, 100, 60)
+    sens = st.slider("حساسية الرصد والاستجابة (Sensitivity)", 20, 100, 65)
 
     st.markdown("---")
-    play_speed = st.slider("معدل العرض (FPS)", 6, 30, 16)
-    max_f = st.slider("إجمالي الإطارات للفحص (Max Frames)", 80, 800, 320, step=20)
+    play_speed = st.slider("معدل العرض (FPS)", 6, 30, 18)
+    max_f = st.slider("إجمالي الإطارات للفحص (Max Frames)", 80, 800, 300, step=20)
 
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -721,7 +614,7 @@ def run_detection():
     state = new_state()
     p_bar = st.progress(0.0, text="جاري فحص وتتبع حركة الحشود...")
     tfile_path = None
-    is_sim = feed_mode.startswith("وضع المحاكاة")
+    is_sim = (mode_choice == "Simulation")
 
     if is_sim:
         w, h, cap, fps_src, total_frames = 640, 400, None, 25.0, max_f
@@ -729,10 +622,13 @@ def run_detection():
         if uploaded_vid is None:
             st.warning("الرجاء رفع ملف فيديو أولاً.")
             return
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tf.write(uploaded_vid.read())
-        tfile_path = tf.name
-        tf.close()
+        
+        # Safe Cloud-compatible persistent temp writing
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(uploaded_vid.getbuffer())
+        tfile_path = tfile.name
+        tfile.close()
+        
         cap = cv2.VideoCapture(tfile_path)
         fps_src = cap.get(cv2.CAP_PROP_FPS) or 25.0
         v_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max_f
@@ -747,7 +643,7 @@ def run_detection():
             frame_bgr, evts, tracks = process_sim(frame_idx, state, sens, w, h)
         else:
             ok, raw = cap.read()
-            if not ok:
+            if not ok or raw is None:
                 break
             raw = cv2.resize(raw, (w, h))
             frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, state, sens)
