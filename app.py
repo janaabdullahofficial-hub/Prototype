@@ -767,6 +767,8 @@ def run_detection():
                 )
             )
 
+        frame_start = time.time()
+
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         st.session_state.last_img = rgb
         elapsed = max(time.time() - start_t, 1e-6)
@@ -777,12 +779,22 @@ def run_detection():
             "time": frame_idx / fps_src,
         }
 
-        cam_holder.image(rgb, use_container_width=True)
-        render_kpis(st.session_state.metrics)
+        # JPEG encodes much faster than PNG for photo-like frames -> lower per-frame overhead
+        cam_holder.image(rgb, use_container_width=True, output_format="JPEG")
 
         proc += 1
-        p_bar.progress(proc / total_frames, text=f"تحليل الإطارات الذكي... {proc}/{total_frames}")
-        time.sleep(1.0 / play_speed)
+        # Updating KPIs/progress every single frame is a big chunk of the per-frame cost;
+        # throttling these to a few times per second removes most of the lag without
+        # making the UI feel unresponsive.
+        if proc % 3 == 0 or proc == total_frames:
+            render_kpis(st.session_state.metrics)
+            p_bar.progress(proc / total_frames, text=f"تحليل الإطارات الذكي... {proc}/{total_frames}")
+
+        # Subtract the time this iteration's processing + rendering actually took,
+        # so the real frame rate matches play_speed instead of sleep + overhead.
+        target_dt = 1.0 / play_speed
+        render_cost = time.time() - frame_start
+        time.sleep(max(0.0, target_dt - render_cost))
 
     if cap:
         cap.release()
