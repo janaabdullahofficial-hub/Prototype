@@ -1,11 +1,13 @@
 """
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
-Full English UI with Persistent Anomaly Bounding Box Tracking & Continuous Video Stream
+Parallel Threaded Streaming Pipeline & Dynamic Real-Time Bounding Box Removal
 """
 
 import math
 import os
+import queue
 import tempfile
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -16,7 +18,7 @@ import numpy as np
 import streamlit as st
 
 # ============================================================================
-# PAGE CONFIG & COMMAND CENTER THEME
+# PAGE CONFIG & SYSTEM THEME
 # ============================================================================
 
 st.set_page_config(
@@ -112,7 +114,7 @@ st.markdown(
 )
 
 # ============================================================================
-# ENGLISH TAXONOMY MAPPING
+# ENGLISH TAXONOMY
 # ============================================================================
 
 TAXONOMY_RULES = {
@@ -227,7 +229,7 @@ class Alert:
 class Track:
     def __init__(self, track_id, centroid, bbox, frame_idx):
         self.id = track_id
-        self.history = deque(maxlen=45)
+        self.history = deque(maxlen=20)
         self.age = 0
         self.update(centroid, bbox, frame_idx)
 
@@ -254,7 +256,6 @@ def extract_features(track: Track):
 
     aspect_curr = float(np.mean(aspect_ratios[-3:]))
     h_drop = (np.mean(heights[:3]) - np.mean(heights[-3:])) / max(np.mean(heights[:3]), 1.0)
-    vert_v = np.diff(cys) / curr_h
     horiz_v = np.diff(cxs) / curr_h
 
     displacement = math.hypot(cxs[-1] - cxs[0], cys[-1] - cys[0]) / curr_h
@@ -273,35 +274,44 @@ def extract_features(track: Track):
 def classify_taxonomy(f: dict, sensitivity: int):
     s = sensitivity / 100.0
 
-    # Sunstroke
-    if f["speed_mean"] < 0.015 and 0.015 < f["speed_jitter"] < 0.04 and f["aspect_curr"] > 0.6:
+    if f["speed_mean"] < 0.012 and 0.015 < f["speed_jitter"] < 0.035 and f["aspect_curr"] > 0.65:
         return "sunstroke_heat_exhaustion", min(0.96, 0.75 + 0.2 * s)
 
-    # Fall & Seizure
-    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.25 * (1.1 - 0.3 * s)):
-        if f["speed_jitter"] > 0.03:
+    if (f["aspect_curr"] > 1.1 and f["h_drop"] > 0.28 * (1.1 - 0.3 * s)):
+        if f["speed_jitter"] > 0.035:
             return "sudden_fall_followed_by_seizure", min(0.98, 0.80 + 0.15 * s)
         return "sudden_fall", min(0.95, 0.78 + 0.18 * s)
 
-    # Lying Immobile
-    if f["aspect_curr"] > 1.10 and f["displacement"] < 0.20:
+    if f["aspect_curr"] > 1.15 and f["displacement"] < 0.15:
         return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
 
-    # Limping & Fatigue
-    if f["speed_jitter"] > 0.035:
-        if f["speed_jitter"] > 0.07:
-            return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 3.0)
-        return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 3.5)
+    if f["speed_jitter"] > 0.05:
+        if f["speed_jitter"] > 0.09:
+            return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 2.5)
+        return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 2.5)
 
-    if f["speed_mean"] < 0.03 and f["h_drop"] > 0.08:
+    if f["speed_mean"] < 0.025 and f["h_drop"] > 0.1:
         return "Exhausted_walking", min(0.85, 0.60 + 0.2 * s)
 
     return None, 0.0
 
 
 # ============================================================================
-# OPENCV ENGINE
+# PARALLEL PROCESSING THREAD PIPELINE
 # ============================================================================
+
+def frame_producer(video_path, max_frames, frame_queue):
+    cap = cv2.VideoCapture(video_path)
+    count = 0
+    while cap.isOpened() and count < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_queue.put((count + 1, frame))
+        count += 1
+    cap.release()
+    frame_queue.put((None, None))
+
 
 def new_state():
     return {
@@ -309,14 +319,13 @@ def new_state():
         "tracks": {},
         "next_id": 1,
         "global_cd": {},
-        "persistent_anomalies": [], # 🌟 ذاكرة حفظ أماكن الأنومالي
     }
 
 
 def process_video_frame(frame, frame_idx, state, sensitivity):
     canvas = frame.copy()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (21, 21), 0)
+    gray = cv2.GaussianBlur(gray, (15, 15), 0)
 
     if state["prev_gray"] is None:
         state["prev_gray"] = gray
@@ -325,21 +334,21 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
     frame_diff = cv2.absdiff(state["prev_gray"], gray)
     state["prev_gray"] = gray
 
-    _, thresh = cv2.threshold(frame_diff, 15, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(frame_diff, 20, 255, cv2.THRESH_BINARY)
     thresh = cv2.dilate(thresh, None, iterations=2)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detections = []
     for c in contours:
-        if cv2.contourArea(c) < 350:
+        if cv2.contourArea(c) < 600:
             continue
         x, y, w, h = cv2.boundingRect(c)
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h)))
 
     assigned = set()
     for (cx, cy), (x, y, w, h) in detections:
-        best_id, best_d = None, 180.0
+        best_id, best_d = None, 120.0
         for tid, tr in state["tracks"].items():
             if tid in assigned:
                 continue
@@ -355,7 +364,8 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
             state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
             assigned.add(tid)
 
-    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 15]:
+    # حرق المسارات المتوقفة أو الخارجة فم فوراً لتفريغ الشاشة
+    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 5]:
         del state["tracks"][tid]
 
     new_alerts = []
@@ -368,31 +378,24 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
             cond, conf = classify_taxonomy(f, sensitivity)
             if cond and cond in TAXONOMY_RULES:
                 info = TAXONOMY_RULES[cond]
-                tag = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
+                label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
 
-                # حفظ المربع في الذاكرة الدائمة ليبقى على الفيديو طوال العرض
-                state["persistent_anomalies"].append({"bbox": (x, y, w, h), "label": tag})
+                # 🟢 رسم المربع الأحمر بشكل مؤقت وحين وجود العَرَض فقط
+                cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 2)
+                cv2.rectangle(canvas, (x, max(y - 20, 0)), (x + tw + 6, max(y, 20)), (0, 0, 255), -1)
+                cv2.putText(canvas, label, (x + 3, max(y - 5, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
                 last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 100:
+                if frame_idx - last_f > 75:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
-
-    # 🎨 رسم كافة المربعات المسجلة كـ Abnormal طول مدة الفيديو
-    for anomaly in state["persistent_anomalies"]:
-        ax, ay, aw, ah = anomaly["bbox"]
-        label = anomaly["label"]
-        cv2.rectangle(canvas, (ax, ay), (ax + aw, ay + ah), (0, 0, 255), 3)
-        
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 2)
-        cv2.rectangle(canvas, (ax, max(ay - 22, 0)), (ax + tw + 8, max(ay, 22)), (0, 0, 255), -1)
-        cv2.putText(canvas, label, (ax + 4, max(ay - 6, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
 
     return canvas, new_alerts, len(state["tracks"])
 
 
 # ============================================================================
-# STREAMLIT UI & RUNTIME
+# STREAMLIT UI & CONSUMER RUNTIME
 # ============================================================================
 
 if "alerts" not in st.session_state:
@@ -423,7 +426,7 @@ with st.sidebar:
     sens = st.slider("Detection Sensitivity", 20, 100, 70)
 
     st.markdown("---")
-    play_speed = st.slider("Playback FPS Speed", 10, 30, 20)
+    play_speed = st.slider("Playback FPS Speed", 15, 30, 24)
     max_f = st.slider("Max Processing Frames", 100, 1500, 500, step=50)
 
     st.markdown("---")
@@ -498,23 +501,21 @@ def run_detection():
     tfile_path = tf.name
     tf.close()
 
-    cap = cv2.VideoCapture(tfile_path)
-    fps_src = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    v_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max_f
-    total_frames = min(max_f, v_total)
-    w, h = 640, 400
+    frame_queue = queue.Queue(maxsize=30)
+    prod_thread = threading.Thread(target=frame_producer, args=(tfile_path, max_f, frame_queue), daemon=True)
+    prod_thread.start()
 
+    w, h = 640, 360
+    fps_src = 25.0
     start_t = time.time()
-    frame_idx = 0
     proc = 0
     target_delay = 1.0 / play_speed
 
-    while proc < total_frames:
+    while True:
         loop_start = time.time()
-        frame_idx += 1
+        frame_idx, raw = frame_queue.get()
 
-        ok, raw = cap.read()
-        if not ok:
+        if frame_idx is None:
             break
 
         raw = cv2.resize(raw, (w, h))
@@ -547,7 +548,6 @@ def run_detection():
             "time": frame_idx / fps_src,
         }
 
-        # تحديث المكونات بسلاسة دون تجمد
         cam_holder.image(rgb, channels="RGB", use_container_width=True)
         kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
         triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
@@ -557,7 +557,6 @@ def run_detection():
         if sleep_time > 0:
             time.sleep(sleep_time)
 
-    cap.release()
     if os.path.exists(tfile_path):
         try:
             os.remove(tfile_path)
