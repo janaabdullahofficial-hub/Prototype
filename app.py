@@ -246,7 +246,7 @@ TAXONOMY_RULES = {
     },
     "choking_cough": {
         "category": "Medical & Respiratory Distress",
-        "ar": "كحة واختناق ناتج عن الأدخنة أو الغبار",
+        "ar": "كحة وااختناق ناتج عن الأدخنة أو الغبار",
         "en": "choking_cough",
         "priority": "High",
         "color": "#F97316",
@@ -450,8 +450,6 @@ def classify_taxonomy(f: dict, sensitivity: int):
 # OPENCV ENGINE (ANTI-CLUTTER FILTERED)
 # ============================================================================
 
-# Built once at import time instead of once per frame -> removes a repeated,
-# unnecessary allocation from the hottest loop in the app.
 _KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 _KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
 
@@ -482,7 +480,6 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
             continue
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h), area))
 
-    # Keep top 2 largest candidates to isolate true human targets
     detections = sorted(detections, key=lambda d: d[2], reverse=True)[:2]
 
     assigned = set()
@@ -503,7 +500,6 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
             state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
             assigned.add(tid)
 
-    # Prune stale tracks
     for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 12]:
         del state["tracks"][tid]
 
@@ -726,6 +722,7 @@ def run_detection():
     st.session_state.alerts = []
     state = new_state()
     is_sim = feed_mode.startswith("وضع المحاكاة")
+    tfile_path = None  # إصلاح خطأ المتغير المفقود
 
     if is_sim:
         w, h, cap, fps_src, total_frames = 640, 400, None, 25.0, max_f
@@ -733,13 +730,12 @@ def run_detection():
         if uploaded_vid is None:
             st.warning("الرجاء رفع ملف فيديو أولاً.")
             return
-        
-        # حفظ الملف المؤقت
+
         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tf.write(uploaded_vid.read())
         tfile_path = tf.name
         tf.close()
-        
+
         cap = cv2.VideoCapture(tfile_path)
         fps_src = cap.get(cv2.CAP_PROP_FPS) or 25.0
         v_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max_f
@@ -750,7 +746,6 @@ def run_detection():
     frame_idx = 0
     proc = 0
 
-    # حساب زمن التأخير المطلوب بدقة بين الإطارات
     target_delay = 1.0 / play_speed
 
     while proc < total_frames:
@@ -764,11 +759,10 @@ def run_detection():
             if not ok:
                 break
             
-            # اختياري: إذا كان الفيديو سريعاً جداً، يمكن معالجة إطار وتخطي إطار
             raw = cv2.resize(raw, (w, h))
             frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, state, sens)
 
-        # تسجيل التنبيهات الجديدة
+        has_new_alert = False
         for cond, conf in evts:
             seq_num = len(st.session_state.alerts) + 1
             st.session_state.alerts.append(
@@ -783,17 +777,15 @@ def run_detection():
                     confidence=conf,
                 )
             )
+            has_new_alert = True
 
-        # التحويل للعرض
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         st.session_state.last_img = rgb
-
-        # 1. تحديث الصورة فوراً وبأسرع صيغة (JPEG)
         cam_holder.image(rgb, use_container_width=True, output_format="JPEG")
 
         proc += 1
         elapsed = max(time.time() - start_t, 1e-6)
-        
+
         st.session_state.metrics = {
             "frame": frame_idx,
             "tracks": tracks,
@@ -801,11 +793,13 @@ def run_detection():
             "time": frame_idx / fps_src,
         }
 
-        # 2. تحديث الـ KPIs كل 5 إطارات فقط بدلاً من كل إطار وتقليل الضغط على المتصفح
         if proc % 5 == 0 or proc == total_frames:
             render_kpis(st.session_state.metrics)
 
-        # 3. مزامنة الوقت الحقيقي (Real-time Pacing)
+        # رسم البلاغات فوراً أثناء البث في حال وجود حالة جديدة
+        if has_new_alert:
+            render_triage()
+
         compute_duration = time.time() - loop_start
         sleep_time = target_delay - compute_duration
         if sleep_time > 0:
@@ -813,14 +807,17 @@ def run_detection():
 
     if cap:
         cap.release()
-    if not is_sim and tfile_path and os.path.exists(tfile_path):
+    if tfile_path and os.path.exists(tfile_path):
         try:
             os.remove(tfile_path)
         except Exception:
             pass
 
-    # تحديث سجل السجلات والفرز بعد اكتمال المعالجة
     render_triage()
 
-render_kpis(st.session_state.metrics)
-render_triage()
+
+if start_btn:
+    run_detection()
+else:
+    render_kpis(st.session_state.metrics)
+    render_triage()
