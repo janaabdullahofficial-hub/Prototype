@@ -2,9 +2,9 @@
 نظام بصير للرصد والفرز الإسعافي والأمني المبكر
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
 ========================================================================
-- Complete Streamlit-Compatible Live Streaming (No-Freeze Loop)
-- Exact 22-Class Taxonomy Architecture
-- Zero Key Collision Guarantee & Anti-Ghosting Spatial Filtering
+- Streamlit Live Streaming Engine
+- Custom Taxonomy Architecture
+- Zero Key Collision & Anti-Ghosting Spatial Filtering
 """
 
 import math
@@ -110,121 +110,131 @@ st.markdown(
         font-size: 0.7rem;
         margin-bottom: 0.3rem;
     }
-    .eta-box {
-        background: rgba(16, 185, 129, 0.12);
-        border: 1px solid #10B981;
-        color: #10B981;
-        padding: 6px 10px;
-        border-radius: 6px;
-        font-weight: 700;
-        font-size: 0.82rem;
-        text-align: center;
-    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ============================================================================
-# EXACT 22-CLASS TAXONOMY MAPPING
+# UPDATED TAXONOMY MAPPING
 # ============================================================================
 
 TAXONOMY_RULES = {
     # 1. Physical Violence & Assaults
-    "boxing_fighting": {
+    "fighting": {
         "category": "Physical Violence & Assaults",
-        "ar": "مضاربة كيك بوكسنغ واعتداء جسدي",
-        "en": "boxing_fighting",
+        "ar": "شجار واشتباك جسدي",
+        "en": "fighting",
         "priority": "High",
         "color": "#F97316",
         "icon": "🥊",
         "action": "توجيه دورية أمن الميدان فوراً لفض الاشتباك",
     },
-    "kicking_assault": {
-        "category": "Physical Violence & Assaults",
-        "ar": "مضاربة واعتداء بالركل",
-        "en": "kicking_assault",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "🥋",
-        "action": "توجيه الأمن الميداني وتأمين المارة",
-    },
 
-    # 2. Falls & Abnormal Locomotion
+    # 2. Falls & Complex Medical Emergencies
     "sudden_fall": {
-        "category": "Falls & Abnormal Locomotion",
+        "category": "Falls & Complex Medical Emergencies",
         "ar": "سقوط مفاجئ وفقدان فوري للتوازن",
         "en": "sudden_fall",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "🚨",
-        "action": "توجيه فرقة الإنعاش القلبي والتدخل السريع",
+        "action": "توجيه فرقة التدخل السريع",
     },
     "slow_fall": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "سقوط بطيء وتدريجي (هبوط إعياء)",
+        "category": "Falls & Complex Medical Emergencies",
+        "ar": "سقوط بطيء وتدريجي",
         "en": "slow_fall",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "⬇️",
-        "action": "فحص العلامات الحيوية ونقل المصاب للتبريد",
+        "action": "فحص العلامات الحيوية ونقل المصاب",
     },
-    "fall_and_recovery": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "تعثر وسقوط مع محاولة النهوض",
-        "en": "fall_and_recovery",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🔄",
-        "action": "المراقبة البصرية ومساندة الحركة",
+    "sudden_fall_followed_by_seizure": {
+        "category": "Falls & Complex Medical Emergencies",
+        "ar": "سقوط مفاجئ متبوع بنوبة تشنج/صرع",
+        "en": "sudden_fall_followed_by_seizure",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "⚡",
+        "action": "تأمين محيط المصاب وحماية الرأس وتوجيه إسعاف عاجل",
     },
-    "severe_gait_limping": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "عرج شديد ومطرد (إجهاد حاد)",
-        "en": "severe_gait_limping",
+    "slow_fall_followed_by_seizure": {
+        "category": "Falls & Complex Medical Emergencies",
+        "ar": "سقوط بطيء متبوع بنوبة تشنج/صرع",
+        "en": "slow_fall_followed_by_seizure",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "⚡",
+        "action": "توجيه العناية المركزة الميدانية مباشرة",
+    },
+    "slow_fall_followed_by_opisthotonos": {
+        "category": "Falls & Complex Medical Emergencies",
+        "ar": "سقوط بطيء متبوع بتشنج ظهري (Opisthotonos)",
+        "en": "slow_fall_followed_by_opisthotonos",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "☣️",
+        "action": "تثبيت العمود الفقري واستدعاء الطبيب المناظر",
+    },
+    "rolling_and_severe_coughing": {
+        "category": "Falls & Complex Medical Emergencies",
+        "ar": "تدحرج على الأرض وسعال حاد",
+        "en": "rolling_and_severe_coughing",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "🫁",
+        "action": "توفير قناع أكسجين وتأمين مجرى التنفس",
+    },
+    "lying_immobile": {
+        "category": "Falls & Complex Medical Emergencies",
+        "ar": "استلقاء وسقوط بدون حركة (فقدان وعي)",
+        "en": "lying_immobile",
+        "priority": "Critical",
+        "color": "#DC2626",
+        "icon": "🛑",
+        "action": "توجيه فريق الإنعاش القلبي الرئوي",
+    },
+    "crawling_on_floor": {
+        "category": "Falls & Complex Medical Emergencies",
+        "ar": "زحف كامل على الأرض وعدم قدرة على الوقوف",
+        "en": "crawling_on_floor",
         "priority": "High",
         "color": "#F97316",
+        "icon": "🚷",
+        "action": "إرسال نقالة طبية عاجلة لمنع الدهس",
+    },
+
+    # 3. Abnormal Gait & Physical Fatigue
+    "regular_limping": {
+        "category": "Abnormal Gait & Fatigue",
+        "ar": "عرج منتظم (خطوات متشابهة ومتكررة)",
+        "en": "regular_limping",
+        "priority": "Medium",
+        "color": "#F59E0B",
         "icon": "🚶",
         "action": "توجيه كرسي إسعافي متحرك لنقل المصاب",
     },
     "irregular_limping": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "عرج خفيف غير منتظم",
+        "category": "Abnormal Gait & Fatigue",
+        "ar": "عرج غير منتظم (خطوات متغيرة وغير متناسقة)",
         "en": "irregular_limping",
-        "priority": "Medium",
-        "color": "#F59E0B",
+        "priority": "High",
+        "color": "#F97316",
         "icon": "👣",
-        "action": "تنبيه نقطة الرعاية الميدانية القريبة",
+        "action": "تنبيه نقطة الرعاية الميدانية وتفقد القدم",
     },
-    "crawling_on_floor": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "زحف كامل على الأرض وعدم قدرة على الوقوف",
-        "en": "crawling_on_floor",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "🚷",
-        "action": "إرسال نقالة طبية عاجلة لمنع الدهس",
-    },
-    "crawling_exhausted": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "حبـو وإجهاد بدني شديد من التعب",
-        "en": "crawling_exhausted",
+    "Exhausted_walking": {
+        "category": "Abnormal Gait & Fatigue",
+        "ar": "مشي بإجهاد وإعياء حاد",
+        "en": "Exhausted_walking",
         "priority": "High",
         "color": "#F97316",
-        "icon": "🧎",
-        "action": "توجيه مسعف مباشر لتزويده بالسوائل",
-    },
-    "stooped_walking_resting": {
-        "category": "Falls & Abnormal Locomotion",
-        "ar": "مشي بظهر منحنٍ واستناد للراحة عند الرصيف",
-        "en": "stooped_walking_resting",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "🧍",
-        "action": "نقل المصاب إلى مظلة رعاية وتفقد الضغط",
+        "icon": "😫",
+        "action": "تقديم السوائل ونقل المصاب لمنطقة التبريد",
     },
     "arm_injury": {
-        "category": "Falls & Abnormal Locomotion",
+        "category": "Abnormal Gait & Fatigue",
         "ar": "إصابة والتواء في الذراع / اليد",
         "en": "arm_injury",
         "priority": "Medium",
@@ -233,36 +243,9 @@ TAXONOMY_RULES = {
         "action": "توجيه حقيبة إسعافات أولية لتثبيت الذراع",
     },
 
-    # 3. Medical & Respiratory Distress
-    "severe_choking_on_ground": {
-        "category": "Medical & Respiratory Distress",
-        "ar": "اختناق وسعال حاد مع استلقاء على الأرض",
-        "en": "severe_choking_on_ground",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "🫁",
-        "action": "تأمين مجرى التنفس والتدخل الإسعافي الفوري",
-    },
-    "choking_cough": {
-        "category": "Medical & Respiratory Distress",
-        "ar": "كحة وااختناق ناتج عن الأدخنة أو الغبار",
-        "en": "choking_cough",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "💨",
-        "action": "توفير قناع أكسجين ونقل المصاب لمنطقة مهواة",
-    },
-    "seizure_convulsion": {
-        "category": "Medical & Respiratory Distress",
-        "ar": "تشنج عصبي نشط ونوبة صرع",
-        "en": "seizure_convulsion",
-        "priority": "Critical",
-        "color": "#DC2626",
-        "icon": "⚡",
-        "action": "حماية رأس المصاب وتأمين المحيط فوراً",
-    },
+    # 4. Fast Movement & Dynamic Activities
     "rapid_breathing": {
-        "category": "Medical & Respiratory Distress",
+        "category": "Dynamic Activities & Respiration",
         "ar": "نهث وتسارع غير طبيعي في التنفس",
         "en": "rapid_breathing",
         "priority": "Medium",
@@ -270,10 +253,8 @@ TAXONOMY_RULES = {
         "icon": "🫀",
         "action": "تهدئة المصاب وقياس نسبة تشبع الأكسجين",
     },
-
-    # 4. Fast Movement & Dynamic Activities
     "running_sprinting": {
-        "category": "Fast Movement & Dynamic Activities",
+        "category": "Dynamic Activities & Respiration",
         "ar": "جري وركض سريع في المسار",
         "en": "running_sprinting",
         "priority": "Low",
@@ -281,17 +262,8 @@ TAXONOMY_RULES = {
         "icon": "🏃",
         "action": "مراقبة التدفق لمنع التدافع العشوائي",
     },
-    "jogging": {
-        "category": "Fast Movement & Dynamic Activities",
-        "ar": "هرولة اعتيادية",
-        "en": "jogging",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "🏃",
-        "action": "مراقبة اعتيادية",
-    },
     "jumping": {
-        "category": "Fast Movement & Dynamic Activities",
+        "category": "Dynamic Activities & Respiration",
         "ar": "قفز حركي متكرر",
         "en": "jumping",
         "priority": "Low",
@@ -300,7 +272,7 @@ TAXONOMY_RULES = {
         "action": "مراقبة اعتيادية",
     },
     "dancing": {
-        "category": "Fast Movement & Dynamic Activities",
+        "category": "Dynamic Activities & Respiration",
         "ar": "حركات رقص أو استعراض",
         "en": "dancing",
         "priority": "Low",
@@ -309,33 +281,13 @@ TAXONOMY_RULES = {
         "action": "مراقبة اعتيادية",
     },
     "situps_exercise": {
-        "category": "Fast Movement & Dynamic Activities",
-        "ar": "تمرين الـ Situp / تمارين بدنية أرضية",
+        "category": "Dynamic Activities & Respiration",
+        "ar": "تمارين بدنية أرضية (Sit-ups)",
         "en": "situps_exercise",
         "priority": "Low",
         "color": "#3B82F6",
         "icon": "🧘",
         "action": "مراقبة اعتيادية",
-    },
-
-    # 5. Object Interaction & Environmental Events
-    "bag_throwing_airborne": {
-        "category": "Object Interaction & Events",
-        "ar": "طيران الشنطة / قذف حقيبة في الهواء",
-        "en": "bag_throwing_airborne",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "🎒",
-        "action": "فحص أمني فوري لموقع الحقيبة",
-    },
-    "flying_papers": {
-        "category": "Object Interaction & Events",
-        "ar": "تطاير أوراق أو أجسام خفيفة مع الرياح",
-        "en": "flying_papers",
-        "priority": "Low",
-        "color": "#3B82F6",
-        "icon": "📄",
-        "action": "تنبيه فرق النظافة والصيانة الميدانية",
     },
 }
 
@@ -349,7 +301,7 @@ LOCATIONS = [
 ]
 
 # ============================================================================
-# DATA STRUCTURES
+# DATA STRUCTURES & FEATURE EXTRACTION
 # ============================================================================
 
 @dataclass
@@ -418,35 +370,43 @@ def extract_features(track: Track):
 def classify_taxonomy(f: dict, sensitivity: int):
     s = sensitivity / 100.0
 
-    # 1. Sudden Fall vs Slow Fall
+    # 1. Fall & Seizure Variations
     if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.32 * (1.1 - 0.3 * s)) or (
         f["aspect_prev"] < 0.90 and f["aspect_curr"] > 1.12 and f["max_vert_v"] > 0.05
     ):
-        return "sudden_fall", min(0.98, 0.78 + 0.18 * s)
+        if f["speed_jitter"] > 0.04:
+            return "sudden_fall_followed_by_seizure", min(0.98, 0.80 + 0.15 * s)
+        return "sudden_fall", min(0.95, 0.78 + 0.18 * s)
 
     if 0.22 < f["h_drop"] <= 0.32 and f["aspect_curr"] > 1.0:
+        if f["speed_jitter"] > 0.04:
+            return "slow_fall_followed_by_seizure", min(0.94, 0.75 + 0.18 * s)
         return "slow_fall", min(0.91, 0.65 + 0.2 * s)
 
-    # 2. Prolonged Ground Immobilization & Seizures
+    # 2. Prone & Immobility Conditions
     prone = f["aspect_curr"] > 1.15
-    if prone and f["displacement"] < 0.18:
-        if f["speed_jitter"] > 0.04:
-            return "seizure_convulsion", min(0.95, 0.72 + 0.2 * s)
-        return "severe_choking_on_ground", min(0.92, 0.68 + 0.2 * s)
+    if prone and f["displacement"] < 0.15:
+        if f["speed_jitter"] < 0.01:
+            return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
+        elif f["speed_jitter"] > 0.05:
+            return "rolling_and_severe_coughing", min(0.93, 0.70 + 0.2 * s)
 
-    # 3. Stooped Walking / Rest
-    if 0.18 < f["h_drop"] <= 0.28 and f["aspect_curr"] < 1.05:
-        return "stooped_walking_resting", min(0.86, 0.55 + f["h_drop"] * 0.7)
+    # 3. Exhaustion & Gait Analysis
+    if not prone and f["speed_jitter"] > 0.075 * (1.1 - 0.2 * s):
+        # الفرق بين العرج المنتظم وغير المنتظم بناءً على تشتت السرعة الخطية
+        if f["speed_jitter"] > 0.11:
+            return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 3.0)
+        else:
+            return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 3.5)
 
-    # 4. Gait Limping (معيار مرتفع لتجنب الإشارات الخاطئة)
-    if not prone and f["speed_jitter"] > 0.085 * (1.1 - 0.2 * s):
-        return "severe_gait_limping", min(0.88, 0.55 + f["speed_jitter"] * 4.0)
+    if not prone and f["speed_mean"] < 0.02 and f["h_drop"] > 0.15:
+        return "Exhausted_walking", min(0.85, 0.60 + 0.2 * s)
 
     return None, 0.0
 
 
 # ============================================================================
-# OPENCV ENGINE (ANTI-CLUTTER FILTERED)
+# OPENCV ENGINE
 # ============================================================================
 
 _KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -523,8 +483,6 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
                 tag = f"Abnormal: {info['en']}"
 
                 last_f = state["global_cd"].get(cond, -9999)
-
-                # تبطئ تكرار الإنذار (مرة كل 300 إطار) لمنع تراكم التنبيهات
                 if frame_idx - last_f > 300:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
@@ -542,7 +500,7 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
 # ============================================================================
 
 def process_sim(frame_idx, state, sensitivity, w, h):
-    phases = ["normal_walk", "severe_gait_limping", "stooped_walking_resting", "sudden_fall", "severe_choking_on_ground"]
+    phases = ["normal_walk", "regular_limping", "Exhausted_walking", "sudden_fall_followed_by_seizure", "lying_immobile"]
     p_len = 65
     p_idx = (frame_idx % (p_len * len(phases))) // p_len
     phase = phases[p_idx]
@@ -552,13 +510,13 @@ def process_sim(frame_idx, state, sensitivity, w, h):
     if phase == "normal_walk":
         bw, bh = 46, 125
         cx, cy = w * 0.2 + t * w * 0.4, ground - bh / 2
-    elif phase == "severe_gait_limping":
+    elif phase == "regular_limping":
         bw, bh = 50, 120
-        cx, cy = w * 0.6 + math.sin(t * 22) * 16, ground - bh / 2
-    elif phase == "stooped_walking_resting":
-        bw, bh = 56 + t * 15, 120 - t * 45
+        cx, cy = w * 0.6 + math.sin(t * 18) * 12, ground - bh / 2
+    elif phase == "Exhausted_walking":
+        bw, bh = 54, 100
         cx, cy = w * 0.65, ground - bh / 2
-    elif phase == "sudden_fall":
+    elif phase == "sudden_fall_followed_by_seizure":
         c = min(1.0, t / 0.32)
         bw, bh = 50 + c * 70, 120 - c * 90
         cx, cy = w * 0.65, ground - bh / 2
@@ -610,7 +568,7 @@ st.markdown(
     <div class="header-box">
         <div>
             <div class="system-title">🚑 نظام بصير | AI Anomaly Detection & Triage</div>
-            <div class="system-sub">منظومة الرصد والفرز الذكي للمؤشرات الحيوية والحركية وفق معيار التصنيف المعتمد (22 Class Taxonomy)</div>
+            <div class="system-sub">منظومة الرصد والفرز الذكي للمؤشرات الحيوية والحركية الحرجة</div>
         </div>
         <div class="live-badge">● LIVE DISPATCH SYSTEM</div>
     </div>
@@ -771,7 +729,6 @@ def run_detection():
             "time": frame_idx / fps_src,
         }
 
-        # تحديث الكاميرا والعدادات وسجل البلاغات مباشرة إطاراً بإطار
         cam_holder.image(rgb, use_container_width=True, output_format="JPEG")
         kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
         triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
