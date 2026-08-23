@@ -1,6 +1,26 @@
 """
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
 Full Stream Control with Smooth Frame-by-Frame Rendering
+
+FIX NOTE (frame skipping issue):
+The previous version processed the whole video inside one long Python
+while-loop and called `cam_holder.image(...)` on every iteration. When
+updates to the SAME placeholder arrive faster than the browser/websocket
+can flush them, Streamlit's ForwardMsgQueue coalesces consecutive deltas
+for that element and keeps only the latest one — so visually you only
+ever see the first frame (sent before the backlog built up) and the very
+last frame (the final state once the loop ends). No amount of
+`time.sleep()` inside the loop fixes this, because the whole script is
+still one uninterrupted run.
+
+The fix: stop doing one giant loop. Instead, keep a background thread
+producing frames into a queue (unchanged), and consume ONE frame per
+tick using `st.fragment(run_every=...)`. Each fragment tick is a real,
+independently-flushed rerun of just that fragment, so every frame
+actually gets painted instead of being dropped.
+
+Requires streamlit >= 1.33 (for st.fragment with run_every). If you're
+on an older version: `pip install --upgrade streamlit`.
 """
 
 import math
@@ -55,7 +75,7 @@ st.markdown(
         margin: 0;
     }
     .system-sub { color: #94A3B8; font-size: 0.88rem; margin: 0.2rem 0 0 0; }
-    
+
     .live-badge {
         background: #DC2626;
         color: white;
@@ -304,7 +324,7 @@ def frame_producer(video_path, max_frames, frame_queue):
     frame_queue.put((None, None))
 
 
-def new_state():
+def new_cv_state():
     return {
         "prev_gray": None,
         "tracks": {},
@@ -386,13 +406,17 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
 
 
 # ============================================================================
-# STREAMLIT UI & CONSUMER RUNTIME
+# STREAMLIT UI & FRAGMENT-BASED CONSUMER RUNTIME
 # ============================================================================
 
 if "alerts" not in st.session_state:
     st.session_state.alerts = []
 if "metrics" not in st.session_state:
     st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
+if "streaming" not in st.session_state:
+    st.session_state.streaming = False
+if "engine" not in st.session_state:
+    st.session_state.engine = None  # holds queue/thread/cv-state for the active run
 
 st.markdown(
     """
@@ -426,8 +450,17 @@ with st.sidebar:
     reset_btn = col2.button("⟲ Reset", use_container_width=True)
 
     if reset_btn:
+        # Also tear down any active engine/thread state, not just alerts.
+        eng = st.session_state.engine
+        if eng is not None and eng.get("tfile_path") and os.path.exists(eng["tfile_path"]):
+            try:
+                os.remove(eng["tfile_path"])
+            except Exception:
+                pass
         st.session_state.alerts = []
         st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
+        st.session_state.streaming = False
+        st.session_state.engine = None
         st.rerun()
 
 col_cam, col_triage = st.columns([1.35, 1])
@@ -479,13 +512,17 @@ def draw_triage_html():
     return html_out
 
 
-def run_detection():
+def start_stream():
+    """One-shot setup: save the upload, spin up the producer thread, and
+    arm the engine. Actual frame-by-frame rendering happens in the
+    live_feed fragment below, one frame per tick — never in a blocking
+    loop here."""
     if uploaded_vid is None:
         st.warning("Please upload a video file to run the analytical stream.")
         return
 
     st.session_state.alerts = []
-    state = new_state()
+    st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
 
     tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tf.write(uploaded_vid.read())
@@ -493,75 +530,106 @@ def run_detection():
     tf.close()
 
     frame_queue = queue.Queue(maxsize=50)
-    prod_thread = threading.Thread(target=frame_producer, args=(tfile_path, max_f, frame_queue), daemon=True)
+    prod_thread = threading.Thread(
+        target=frame_producer, args=(tfile_path, max_f, frame_queue), daemon=True
+    )
     prod_thread.start()
 
-    w, h = 640, 360
-    fps_src = 25.0
-    start_t = time.time()
-    proc = 0
+    st.session_state.engine = {
+        "queue": frame_queue,
+        "cv_state": new_cv_state(),
+        "tfile_path": tfile_path,
+        "w": 640,
+        "h": 360,
+        "fps_src": 25.0,
+        "sens": sens,
+        "zone": selected_zone,
+        "frame_delay": 1.0 / max(play_speed, 1),
+        "next_allowed": 0.0,
+        "proc": 0,
+        "start_t": time.time(),
+    }
+    st.session_state.streaming = True
 
-    frame_delay = 1.0 / max(play_speed, 1)
 
-    while True:
-        frame_idx, raw = frame_queue.get()
+@st.fragment(run_every=0.03)
+def live_feed():
+    """Runs on its own timer, independent of the rest of the app.
+    Each tick paints AT MOST one new frame, so every frame is a real,
+    individually-flushed update instead of being coalesced away."""
+    if not st.session_state.streaming or st.session_state.engine is None:
+        return
 
-        if frame_idx is None:
-            break
+    eng = st.session_state.engine
+    now = time.time()
+    if now < eng["next_allowed"]:
+        return  # not time for the next frame yet — keep current one on screen
+    eng["next_allowed"] = now + eng["frame_delay"]
 
-        raw = cv2.resize(raw, (w, h))
-        frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, state, sens)
+    try:
+        frame_idx, raw = eng["queue"].get_nowait()
+    except queue.Empty:
+        return  # producer hasn't delivered the next frame yet, try next tick
 
-        for cond, conf in evts:
-            seq_num = len(st.session_state.alerts) + 1
-            st.session_state.alerts.append(
-                Alert(
-                    id=f"EMS-{seq_num:03d}",
-                    unique_key=f"{seq_num}_{frame_idx}_{int(time.time()*1000)}",
-                    frame_idx=frame_idx,
-                    video_time_s=frame_idx / fps_src,
-                    wall_clock=datetime.now().strftime("%H:%M:%S"),
-                    location=selected_zone,
-                    condition_key=cond,
-                    confidence=conf,
-                )
+    if frame_idx is None:
+        # Stream finished.
+        st.session_state.streaming = False
+        if eng["tfile_path"] and os.path.exists(eng["tfile_path"]):
+            try:
+                os.remove(eng["tfile_path"])
+            except Exception:
+                pass
+        kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
+        triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
+        return
+
+    raw = cv2.resize(raw, (eng["w"], eng["h"]))
+    frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, eng["cv_state"], eng["sens"])
+
+    for cond, conf in evts:
+        seq_num = len(st.session_state.alerts) + 1
+        st.session_state.alerts.append(
+            Alert(
+                id=f"EMS-{seq_num:03d}",
+                unique_key=f"{seq_num}_{frame_idx}_{int(time.time()*1000)}",
+                frame_idx=frame_idx,
+                video_time_s=frame_idx / eng["fps_src"],
+                wall_clock=datetime.now().strftime("%H:%M:%S"),
+                location=eng["zone"],
+                condition_key=cond,
+                confidence=conf,
             )
+        )
 
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        proc += 1
-        elapsed = max(time.time() - start_t, 1e-6)
+    eng["proc"] += 1
+    elapsed = max(time.time() - eng["start_t"], 1e-6)
 
-        st.session_state.metrics = {
-            "frame": frame_idx,
-            "tracks": tracks,
-            "fps": proc / elapsed,
-            "time": frame_idx / fps_src,
-        }
+    st.session_state.metrics = {
+        "frame": frame_idx,
+        "tracks": tracks,
+        "fps": eng["proc"] / elapsed,
+        "time": frame_idx / eng["fps_src"],
+    }
 
-        # 🟢 عرض الإطار الحالي في المتصفح
-        cam_holder.image(rgb, channels="RGB", use_container_width=True)
-
-        # 🟢 وقت تأخير لإعطاء المتصفح مهلة لتنفيذ تحديث الرسوميات وسلاسة العرض
-        time.sleep(frame_delay)
-
-        # تحديث لوحة التحكم وسجل التنبيهات كل 2 إطار لتخفيف العبء على Streamlit
-        if proc % 2 == 0:
-            kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
-            triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
-
+    # 🟢 عرض الإطار الحالي — تحديث حقيقي مستقل في كل نبضة
+    cam_holder.image(rgb, channels="RGB", use_container_width=True)
     kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
-    triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
 
-    if os.path.exists(tfile_path):
-        try:
-            os.remove(tfile_path)
-        except Exception:
-            pass
+    # سجل التنبيهات نحدثه أقل تكرارًا فقط لتخفيف العبء (ما يؤثر على الفيديو نفسه)
+    if eng["proc"] % 3 == 0 or evts:
+        triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
 
 
 if start_btn:
-    run_detection()
-else:
+    start_stream()
+
+# Idle placeholders before any stream has run.
+if st.session_state.engine is None:
     kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
     triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
+
+# Always mount the fragment; it self-schedules via run_every and simply
+# no-ops when streaming is False.
+live_feed()
