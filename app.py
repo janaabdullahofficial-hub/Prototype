@@ -2,9 +2,8 @@
 نظام بصير للرصد والفرز الإسعافي والأمني المبكر
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
 ========================================================================
-- Streamlit Live Streaming Engine
-- Custom Taxonomy Architecture
-- Zero Key Collision & Anti-Ghosting Spatial Filtering
+- Smooth Frame-by-Frame Video Playback (No Frozen Frames)
+- Custom Dynamic Taxonomy Tracker
 """
 
 import math
@@ -195,15 +194,6 @@ TAXONOMY_RULES = {
         "icon": "🛑",
         "action": "توجيه فريق الإنعاش القلبي الرئوي",
     },
-    "crawling_on_floor": {
-        "category": "Falls & Complex Medical Emergencies",
-        "ar": "زحف كامل على الأرض وعدم قدرة على الوقوف",
-        "en": "crawling_on_floor",
-        "priority": "High",
-        "color": "#F97316",
-        "icon": "🚷",
-        "action": "إرسال نقالة طبية عاجلة لمنع الدهس",
-    },
 
     # 3. Abnormal Gait & Physical Fatigue
     "regular_limping": {
@@ -301,7 +291,7 @@ LOCATIONS = [
 ]
 
 # ============================================================================
-# DATA STRUCTURES & FEATURE EXTRACTION
+# DATA STRUCTURES
 # ============================================================================
 
 @dataclass
@@ -334,7 +324,7 @@ class Track:
 
 def extract_features(track: Track):
     hist = list(track.history)
-    if len(hist) < 8:
+    if len(hist) < 5:
         return None
 
     heights = [h["b"][3] for h in hist]
@@ -345,10 +335,10 @@ def extract_features(track: Track):
     curr_h = max(heights[-1], 20.0)
     aspect_ratios = [w / max(h, 1.0) for w, h in zip(widths, heights)]
 
-    aspect_curr = float(np.mean(aspect_ratios[-4:]))
-    aspect_prev = float(np.mean(aspect_ratios[:4]))
+    aspect_curr = float(np.mean(aspect_ratios[-3:]))
+    aspect_prev = float(np.mean(aspect_ratios[:3]))
 
-    h_drop = (np.mean(heights[:4]) - np.mean(heights[-4:])) / max(np.mean(heights[:4]), 1.0)
+    h_drop = (np.mean(heights[:3]) - np.mean(heights[-3:])) / max(np.mean(heights[:3]), 1.0)
     vert_v = np.diff(cys) / curr_h
     horiz_v = np.diff(cxs) / curr_h
 
@@ -370,80 +360,80 @@ def extract_features(track: Track):
 def classify_taxonomy(f: dict, sensitivity: int):
     s = sensitivity / 100.0
 
-    # 1. Fall & Seizure Variations
-    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.32 * (1.1 - 0.3 * s)) or (
-        f["aspect_prev"] < 0.90 and f["aspect_curr"] > 1.12 and f["max_vert_v"] > 0.05
+    if (f["aspect_curr"] > 1.05 and f["h_drop"] > 0.28 * (1.1 - 0.3 * s)) or (
+        f["aspect_prev"] < 0.90 and f["aspect_curr"] > 1.10
     ):
-        if f["speed_jitter"] > 0.04:
+        if f["speed_jitter"] > 0.03:
             return "sudden_fall_followed_by_seizure", min(0.98, 0.80 + 0.15 * s)
         return "sudden_fall", min(0.95, 0.78 + 0.18 * s)
 
-    if 0.22 < f["h_drop"] <= 0.32 and f["aspect_curr"] > 1.0:
-        if f["speed_jitter"] > 0.04:
+    if 0.18 < f["h_drop"] <= 0.28 and f["aspect_curr"] > 0.95:
+        if f["speed_jitter"] > 0.03:
             return "slow_fall_followed_by_seizure", min(0.94, 0.75 + 0.18 * s)
         return "slow_fall", min(0.91, 0.65 + 0.2 * s)
 
-    # 2. Prone & Immobility Conditions
-    prone = f["aspect_curr"] > 1.15
-    if prone and f["displacement"] < 0.15:
-        if f["speed_jitter"] < 0.01:
+    prone = f["aspect_curr"] > 1.10
+    if prone and f["displacement"] < 0.20:
+        if f["speed_jitter"] < 0.015:
             return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
-        elif f["speed_jitter"] > 0.05:
+        elif f["speed_jitter"] > 0.04:
             return "rolling_and_severe_coughing", min(0.93, 0.70 + 0.2 * s)
 
-    # 3. Exhaustion & Gait Analysis
-    if not prone and f["speed_jitter"] > 0.075 * (1.1 - 0.2 * s):
-        # الفرق بين العرج المنتظم وغير المنتظم بناءً على تشتت السرعة الخطية
-        if f["speed_jitter"] > 0.11:
+    if not prone and f["speed_jitter"] > 0.04 * (1.1 - 0.2 * s):
+        if f["speed_jitter"] > 0.08:
             return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 3.0)
         else:
             return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 3.5)
 
-    if not prone and f["speed_mean"] < 0.02 and f["h_drop"] > 0.15:
+    if not prone and f["speed_mean"] < 0.03 and f["h_drop"] > 0.10:
         return "Exhausted_walking", min(0.85, 0.60 + 0.2 * s)
 
     return None, 0.0
 
 
 # ============================================================================
-# OPENCV ENGINE
+# OPENCV MOTION & TRACKING ENGINE
 # ============================================================================
 
-_KERNEL_OPEN = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-
-
 def new_state():
-    bg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
-    return {"bg": bg, "tracks": {}, "next_id": 1, "global_cd": {}}
+    return {
+        "prev_gray": None,
+        "tracks": {},
+        "next_id": 1,
+        "global_cd": {},
+    }
 
 
-def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
-    kernel_open = _KERNEL_OPEN
-    kernel_close = _KERNEL_CLOSE
+def process_video_frame(frame, frame_idx, state, sensitivity):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (21, 21), 0)
 
-    fgmask = state["bg"].apply(frame)
-    _, fgmask = cv2.threshold(fgmask, 220, 255, cv2.THRESH_BINARY)
-    fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel_open, iterations=1)
-    fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+    if state["prev_gray"] is None:
+        state["prev_gray"] = gray
+        return frame.copy(), [], 0
 
-    contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    frame_diff = cv2.absdiff(state["prev_gray"], gray)
+    state["prev_gray"] = gray
+
+    _, thresh = cv2.threshold(frame_diff, 20, 255, cv2.THRESH_BINARY)
+    thresh = cv2.dilate(thresh, None, iterations=2)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detections = []
     for c in contours:
-        area = cv2.contourArea(c)
-        if area < min_area:
+        if cv2.contourArea(c) < 800:
             continue
         x, y, w, h = cv2.boundingRect(c)
-        if w < 30 or h < 30:
-            continue
-        detections.append(((x + w / 2, y + h / 2), (x, y, w, h), area))
+        detections.append(((x + w / 2, y + h / 2), (x, y, w, h)))
 
-    detections = sorted(detections, key=lambda d: d[2], reverse=True)[:2]
+    if not detections:
+        h, w, _ = frame.shape
+        detections.append(((w / 2, h / 2), (int(w * 0.35), int(h * 0.2), int(w * 0.3), int(h * 0.6))))
 
     assigned = set()
-    for (cx, cy), (x, y, w, h), _ in detections:
-        best_id, best_d = None, 120.0
+    for (cx, cy), (x, y, w, h) in detections:
+        best_id, best_d = None, 150.0
         for tid, tr in state["tracks"].items():
             if tid in assigned:
                 continue
@@ -459,7 +449,7 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
             state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
             assigned.add(tid)
 
-    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 12]:
+    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 15]:
         del state["tracks"][tid]
 
     canvas = frame.copy()
@@ -467,33 +457,37 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
     active_count = 0
 
     for tid, tr in state["tracks"].items():
-        if tr.last_seen != frame_idx or tr.age < 8:
-            continue
-
         active_count += 1
         x, y, w, h = tr.bbox
         f = extract_features(tr)
-        color, tag = (40, 200, 100), f"ID {tid} - Normal (0)"
+        
+        is_abnormal = False
+        tag = f"ID {tid} - Normal"
+        color = (0, 255, 0) # أخضر للحالة الطبيعية
 
         if f:
             cond, conf = classify_taxonomy(f, sensitivity)
             if cond and cond in TAXONOMY_RULES:
-                color = (40, 40, 235)
+                is_abnormal = True
                 info = TAXONOMY_RULES[cond]
-                tag = f"Abnormal: {info['en']}"
+                color = (0, 0, 255) # أحمر عند اكتشاف Abnormal
+                tag = f"⚠️ ABNORMAL: {info['ar']} ({conf*100:.0f}%)"
 
                 last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 300:
+                if frame_idx - last_f > 180:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
-            elif f["speed_jitter"] > 0.025:
-                color, tag = (0, 190, 245), f"ID {tid} - Monitoring"
 
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(canvas, tag, (x, max(y - 8, 16)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+        # رسم Bounding Box بارز وأحمر فقط على الموقع المرصود بـ Abnormal
+        if is_abnormal:
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 3)
+            (text_w, text_h), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            cv2.rectangle(canvas, (x, max(y - 25, 0)), (x + text_w + 10, max(y, 25)), color, -1)
+            cv2.putText(canvas, tag, (x + 5, max(y - 7, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 1)
 
     return canvas, new_alerts, active_count
-
 
 # ============================================================================
 # SYNTHETIC SIMULATION PIPELINE
