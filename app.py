@@ -2,9 +2,9 @@
 نظام بصير للرصد والفرز الإسعافي والأمني المبكر
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
 ========================================================================
-- Complete 22-Class Taxonomy Architecture
-- Zero Key Collision Guarantee (Unique Enumerated Keys)
-- Anti-Ghosting / Clutter-Free Spatial Filtering
+- Complete Streamlit-Compatible Live Streaming (No-Freeze Loop)
+- Exact 22-Class Taxonomy Architecture
+- Zero Key Collision Guarantee & Anti-Ghosting Spatial Filtering
 """
 
 import math
@@ -14,7 +14,6 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -436,11 +435,11 @@ def classify_taxonomy(f: dict, sensitivity: int):
         return "severe_choking_on_ground", min(0.92, 0.68 + 0.2 * s)
 
     # 3. Stooped Walking / Rest
-    if 0.15 < f["h_drop"] <= 0.28 and f["aspect_curr"] < 1.05:
+    if 0.18 < f["h_drop"] <= 0.28 and f["aspect_curr"] < 1.05:
         return "stooped_walking_resting", min(0.86, 0.55 + f["h_drop"] * 0.7)
 
-    # 4. Gait Limping
-    if not prone and f["speed_jitter"] > 0.042 * (1.1 - 0.3 * s):
+    # 4. Gait Limping (معيار مرتفع لتجنب الإشارات الخاطئة)
+    if not prone and f["speed_jitter"] > 0.085 * (1.1 - 0.2 * s):
         return "severe_gait_limping", min(0.88, 0.55 + f["speed_jitter"] * 4.0)
 
     return None, 0.0
@@ -524,7 +523,9 @@ def process_video_frame(frame, frame_idx, state, sensitivity, min_area=3200):
                 tag = f"Abnormal: {info['en']}"
 
                 last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 130:
+
+                # تبطئ تكرار الإنذار (مرة كل 300 إطار) لمنع تراكم التنبيهات
+                if frame_idx - last_f > 300:
                     state["global_cd"][cond] = frame_idx
                     new_alerts.append((cond, conf))
             elif f["speed_jitter"] > 0.025:
@@ -585,7 +586,7 @@ def process_sim(frame_idx, state, sensitivity, w, h):
             color = (40, 40, 235)
             tag = f"Abnormal: {TAXONOMY_RULES[cond]['en']}"
             last_f = state["global_cd"].get(cond, -9999)
-            if frame_idx - last_f > 85:
+            if frame_idx - last_f > 150:
                 state["global_cd"][cond] = frame_idx
                 new_alerts.append((cond, conf))
 
@@ -603,8 +604,6 @@ if "alerts" not in st.session_state:
     st.session_state.alerts = []
 if "metrics" not in st.session_state:
     st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
-if "last_img" not in st.session_state:
-    st.session_state.last_img = None
 
 st.markdown(
     """
@@ -648,7 +647,6 @@ with st.sidebar:
     if reset_btn:
         st.session_state.alerts = []
         st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
-        st.session_state.last_img = None
         st.rerun()
 
 col_cam, col_triage = st.columns([1.35, 1])
@@ -660,69 +658,53 @@ with col_cam:
 
 with col_triage:
     st.markdown("##### 🚨 سجل الفرز والتوجيه الميداني (Live Triage Log)")
-    triage_holder = st.container()
+    triage_holder = st.empty()
 
 
-def render_kpis(m):
-    kpi_holder.markdown(
-        f"""
-        <div class="kpi-container">
-            <div class="kpi-card"><div class="kpi-num">{m['frame']}</div><div class="kpi-title">الإطار (Frame)</div></div>
-            <div class="kpi-card"><div class="kpi-num">{m['time']:.1f}s</div><div class="kpi-title">الزمن (Time)</div></div>
-            <div class="kpi-card"><div class="kpi-num">{m['tracks']}</div><div class="kpi-title">الأشخاص (Active)</div></div>
-            <div class="kpi-card"><div class="kpi-num">{m['fps']:.1f}</div><div class="kpi-title">المعالجة (FPS)</div></div>
-            <div class="kpi-card"><div class="kpi-num" style="color:#EF4444">{len(st.session_state.alerts)}</div><div class="kpi-title">البلاغات (Alerts)</div></div>
+def draw_kpi_html(m):
+    return f"""
+    <div class="kpi-container">
+        <div class="kpi-card"><div class="kpi-num">{m['frame']}</div><div class="kpi-title">الإطار (Frame)</div></div>
+        <div class="kpi-card"><div class="kpi-num">{m['time']:.1f}s</div><div class="kpi-title">الزمن (Time)</div></div>
+        <div class="kpi-card"><div class="kpi-num">{m['tracks']}</div><div class="kpi-title">الأشخاص (Active)</div></div>
+        <div class="kpi-card"><div class="kpi-num">{m['fps']:.1f}</div><div class="kpi-title">المعالجة (FPS)</div></div>
+        <div class="kpi-card"><div class="kpi-num" style="color:#EF4444">{len(st.session_state.alerts)}</div><div class="kpi-title">البلاغات (Alerts)</div></div>
+    </div>
+    """
+
+
+def draw_triage_html():
+    if not st.session_state.alerts:
+        return "<div style='color:#94A3B8; padding:1rem; border:1px dashed #334155; border-radius:8px;'>لا توجد بلاغات إسعافية حتى الآن. النظام يراقب البث...</div>"
+
+    html_out = ""
+    for idx, a in enumerate(reversed(st.session_state.alerts)):
+        info = TAXONOMY_RULES.get(a.condition_key, TAXONOMY_RULES["sudden_fall"])
+        b_color = PRIORITY_COLOR[info["priority"]]
+        dispatch_status = "✅ تم توجيه الفرقة" if a.dispatched else "⚠️ قيد الانتظار"
+
+        html_out += f"""
+        <div class="alert-card" style="border-left: 6px solid {b_color};">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span class="triage-badge" style="background:{b_color}">{info['priority']} PRIORITY</span>
+                <span class="card-meta">#{a.id} · {a.wall_clock} · t={a.video_time_s:.1f}s</span>
+            </div>
+            <div style="margin-top:0.3rem;"><span class="category-tag">📂 {info['category']}</span></div>
+            <div class="card-ar">{info['icon']} {info['ar']}</div>
+            <div class="card-en"><b>Class:</b> <code>{info['en']}</code> (الثقة: {a.confidence*100:.0f}%)</div>
+            <div class="card-meta">📍 {a.location}</div>
+            <div style="margin-top:0.4rem; font-size:0.8rem; color:#CBD5E1;"><b>الإجراء الموصى به:</b> {info['action']}</div>
+            <div style="margin-top:0.5rem; font-size:0.85rem; font-weight:bold; color:#38BDF8;">الحالة: {dispatch_status}</div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_triage():
-    triage_holder.empty()
-    with triage_holder:
-        if not st.session_state.alerts:
-            st.info("لا توجد بلاغات إسعافية أو أمنية حرجة حتى الآن. النظام يراقب المؤشرات الحركية...")
-            return
-
-        for idx, a in enumerate(reversed(st.session_state.alerts)):
-            info = TAXONOMY_RULES.get(a.condition_key, TAXONOMY_RULES["sudden_fall"])
-            b_color = PRIORITY_COLOR[info["priority"]]
-            st.markdown(
-                f"""
-                <div class="alert-card" style="border-left: 6px solid {b_color};">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <span class="triage-badge" style="background:{b_color}">{info['priority']} PRIORITY</span>
-                        <span class="card-meta">#{a.id} · {a.wall_clock} · t={a.video_time_s:.1f}s</span>
-                    </div>
-                    <div style="margin-top:0.3rem;"><span class="category-tag">📂 {info['category']}</span></div>
-                    <div class="card-ar">{info['icon']} {info['ar']}</div>
-                    <div class="card-en"><b>Class:</b> <code>{info['en']}</code> (الثقة: {a.confidence*100:.0f}%)</div>
-                    <div class="card-meta">📍 {a.location}</div>
-                    <div style="margin-top:0.4rem; font-size:0.8rem; color:#CBD5E1;"><b>الإجراء الموصى به:</b> {info['action']}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            b1, b2 = st.columns([1.3, 1])
-            with b1:
-                if not a.dispatched:
-                    if st.button("🚑 توجيه فرقة التدخل السريع", key=f"btn_dsp_{a.unique_key}_{idx}", type="primary"):
-                        a.dispatched = True
-                        st.rerun()
-                else:
-                    st.button("✅ تم توجيه الفرقة بنجاح", key=f"btn_done_{a.unique_key}_{idx}", disabled=True)
-            with b2:
-                if a.dispatched:
-                    st.markdown(f'<div class="eta-box">🚨 الفرقة في الطريق (وصول: دقيقة ونصف)</div>', unsafe_allow_html=True)
-            st.write("")
+        """
+    return html_out
 
 
 def run_detection():
     st.session_state.alerts = []
     state = new_state()
     is_sim = feed_mode.startswith("وضع المحاكاة")
-    tfile_path = None  # إصلاح خطأ المتغير المفقود
+    tfile_path = None
 
     if is_sim:
         w, h, cap, fps_src, total_frames = 640, 400, None, 25.0, max_f
@@ -758,11 +740,10 @@ def run_detection():
             ok, raw = cap.read()
             if not ok:
                 break
-            
+
             raw = cv2.resize(raw, (w, h))
             frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, state, sens)
 
-        has_new_alert = False
         for cond, conf in evts:
             seq_num = len(st.session_state.alerts) + 1
             st.session_state.alerts.append(
@@ -777,11 +758,8 @@ def run_detection():
                     confidence=conf,
                 )
             )
-            has_new_alert = True
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        st.session_state.last_img = rgb
-        cam_holder.image(rgb, use_container_width=True, output_format="JPEG")
 
         proc += 1
         elapsed = max(time.time() - start_t, 1e-6)
@@ -793,12 +771,10 @@ def run_detection():
             "time": frame_idx / fps_src,
         }
 
-        if proc % 5 == 0 or proc == total_frames:
-            render_kpis(st.session_state.metrics)
-
-        # رسم البلاغات فوراً أثناء البث في حال وجود حالة جديدة
-        if has_new_alert:
-            render_triage()
+        # تحديث الكاميرا والعدادات وسجل البلاغات مباشرة إطاراً بإطار
+        cam_holder.image(rgb, use_container_width=True, output_format="JPEG")
+        kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
+        triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
 
         compute_duration = time.time() - loop_start
         sleep_time = target_delay - compute_duration
@@ -813,11 +789,9 @@ def run_detection():
         except Exception:
             pass
 
-    render_triage()
-
 
 if start_btn:
     run_detection()
 else:
-    render_kpis(st.session_state.metrics)
-    render_triage()
+    kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
+    triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
