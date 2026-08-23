@@ -725,8 +725,6 @@ def render_triage():
 def run_detection():
     st.session_state.alerts = []
     state = new_state()
-    p_bar = st.progress(0.0, text="جاري فحص وتتبع حركة الحشود...")
-    tfile_path = None
     is_sim = feed_mode.startswith("وضع المحاكاة")
 
     if is_sim:
@@ -735,29 +733,42 @@ def run_detection():
         if uploaded_vid is None:
             st.warning("الرجاء رفع ملف فيديو أولاً.")
             return
+        
+        # حفظ الملف المؤقت
         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tf.write(uploaded_vid.read())
         tfile_path = tf.name
         tf.close()
+        
         cap = cv2.VideoCapture(tfile_path)
         fps_src = cap.get(cv2.CAP_PROP_FPS) or 25.0
         v_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or max_f
         total_frames = min(max_f, v_total)
         w, h = 640, 400
 
-    start_t, frame_idx, proc = time.time(), 0, 0
+    start_t = time.time()
+    frame_idx = 0
+    proc = 0
+
+    # حساب زمن التأخير المطلوب بدقة بين الإطارات
+    target_delay = 1.0 / play_speed
 
     while proc < total_frames:
+        loop_start = time.time()
         frame_idx += 1
+
         if is_sim:
             frame_bgr, evts, tracks = process_sim(frame_idx, state, sens, w, h)
         else:
             ok, raw = cap.read()
             if not ok:
                 break
+            
+            # اختياري: إذا كان الفيديو سريعاً جداً، يمكن معالجة إطار وتخطي إطار
             raw = cv2.resize(raw, (w, h))
             frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, state, sens)
 
+        # تسجيل التنبيهات الجديدة
         for cond, conf in evts:
             seq_num = len(st.session_state.alerts) + 1
             st.session_state.alerts.append(
@@ -773,57 +784,43 @@ def run_detection():
                 )
             )
 
-        frame_start = time.time()
-
+        # التحويل للعرض
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         st.session_state.last_img = rgb
-        elapsed = max(time.time() - start_t, 1e-6)
-        st.session_state.metrics = {
-            "frame": frame_idx,
-            "tracks": tracks,
-            "fps": proc / elapsed if proc else 0.0,
-            "time": frame_idx / fps_src,
-        }
 
-        # JPEG encodes much faster than PNG for photo-like frames -> lower per-frame overhead
+        # 1. تحديث الصورة فوراً وبأسرع صيغة (JPEG)
         cam_holder.image(rgb, use_container_width=True, output_format="JPEG")
 
         proc += 1
-        # Updating KPIs/progress every single frame is a big chunk of the per-frame cost;
-        # throttling these to a few times per second removes most of the lag without
-        # making the UI feel unresponsive.
-        if proc % 3 == 0 or proc == total_frames:
-            render_kpis(st.session_state.metrics)
-            p_bar.progress(proc / total_frames, text=f"تحليل الإطارات الذكي... {proc}/{total_frames}")
+        elapsed = max(time.time() - start_t, 1e-6)
+        
+        st.session_state.metrics = {
+            "frame": frame_idx,
+            "tracks": tracks,
+            "fps": proc / elapsed,
+            "time": frame_idx / fps_src,
+        }
 
-        # Subtract the time this iteration's processing + rendering actually took,
-        # so the real frame rate matches play_speed instead of sleep + overhead.
-        target_dt = 1.0 / play_speed
-        render_cost = time.time() - frame_start
-        time.sleep(max(0.0, target_dt - render_cost))
+        # 2. تحديث الـ KPIs كل 5 إطارات فقط بدلاً من كل إطار وتقليل الضغط على المتصفح
+        if proc % 5 == 0 or proc == total_frames:
+            render_kpis(st.session_state.metrics)
+
+        # 3. مزامنة الوقت الحقيقي (Real-time Pacing)
+        compute_duration = time.time() - loop_start
+        sleep_time = target_delay - compute_duration
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
     if cap:
         cap.release()
-    if tfile_path and os.path.exists(tfile_path):
+    if not is_sim and tfile_path and os.path.exists(tfile_path):
         try:
             os.remove(tfile_path)
         except Exception:
             pass
 
-    p_bar.empty()
+    # تحديث سجل السجلات والفرز بعد اكتمال المعالجة
     render_triage()
-
-
-if start_btn:
-    run_detection()
-
-if st.session_state.last_img is not None:
-    cam_holder.image(st.session_state.last_img, use_container_width=True)
-else:
-    placeholder = np.full((400, 640, 3), (11, 19, 43), dtype=np.uint8)
-    cv2.putText(placeholder, "BASEER MULTI-MODAL TRIAGE", (120, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (72, 202, 228), 2, cv2.LINE_AA)
-    cv2.putText(placeholder, "اضغط بدء الرصد للتشغيل الميداني", (160, 235), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (144, 224, 239), 1, cv2.LINE_AA)
-    cam_holder.image(placeholder, use_container_width=True)
 
 render_kpis(st.session_state.metrics)
 render_triage()
