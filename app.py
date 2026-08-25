@@ -72,6 +72,48 @@ Two changes address most of the false-alarm rate:
    (scaled by sensitivity) before anything is drawn or logged. This is
    the single biggest lever against one-off misclassifications, and it
    costs only a small, expected amount of detection latency.
+
+FIX NOTE 5 (playback speed — video was running slower than real time):
+The producer was pacing purely off a fixed render-fps target (e.g. 12
+fps) regardless of the source clip's own fps. If the source was 25-30
+fps, pushing only 12 frames/sec meant the on-screen playback took
+2-2.5x longer than the clip's real duration — technically smooth, but
+in slow motion. Fixed by reading the source video's real fps and
+DECIMATING (skipping frames evenly) down to the render rate while
+pacing sleeps against the *original* frame timeline, so total playback
+wall-time now matches the clip's real duration.
+
+FIX NOTE 6 (false alarms from blob merges + missed a real heat-exhaustion case):
+Three more changes target this directly:
+1) Track jump-rejection: in a crowd, two people's motion blobs
+   frequently merge then split, which can snap a track's centroid a
+   large, physically-implausible distance in one step. That single
+   jump used to read as huge "jitter"/"speed" and could immediately
+   trigger fighting/limping. A track whose centroid moves further than
+   is plausible for one frame now has its short-term history reset
+   instead of feeding that jump into the motion features.
+2) Small/partial detections are excluded from alert eligibility (see
+   FIX NOTE 7) — most reported false alarms were on small, likely
+   partial blobs, and those are the least reliable signal anyway.
+3) The heat-exhaustion / sunstroke rule was too narrow — it required
+   speed_jitter inside a specific band AND aspect_curr > 0.55, which a
+   person standing mostly still (little to no sway) with a normal
+   upright silhouette can easily fail. Replaced with a broader "barely
+   moving, upright posture" rule keyed on total displacement instead of
+   a jitter band, so both a swaying and a nearly-motionless heat-fatigued
+   person are caught.
+
+FIX NOTE 7 (bounding boxes too small / imprecise):
+Two changes:
+1) `refine_person_box` (the HOG-based tightening step) could return a
+   box much smaller than the actual motion blob when HOG only picked
+   up part of a person (e.g. torso only) — that undersized box was a
+   recurring source of visibly-wrong-looking alerts. It's now
+   sanity-bounded: a refined box that's drastically smaller than the
+   original motion bbox is rejected and the original is used instead.
+2) Every drawn alert box now gets a fixed padding margin added around
+   it, so boxes read clearly on screen instead of hugging (or cutting
+   into) the person.
 """
 
 import base64
@@ -302,6 +344,18 @@ class Track:
         self.update(centroid, bbox, frame_idx)
 
     def update(self, centroid, bbox, frame_idx):
+        # FIX NOTE 6.1: reject implausible one-frame jumps (usually a
+        # crowd blob merging/splitting into a different track) instead of
+        # letting them masquerade as real high-speed/jitter motion.
+        if self.history:
+            prev = self.history[-1]
+            prev_h = max(prev["b"][3], 20.0)
+            jump = math.hypot(centroid[0] - prev["c"][0], centroid[1] - prev["c"][1])
+            if jump > 1.2 * prev_h:
+                self.history.clear()
+                self.pending_cond = None
+                self.pending_count = 0
+
         self.centroid = centroid
         self.bbox = bbox
         self.last_seen = frame_idx
@@ -332,13 +386,24 @@ def extract_features(track: Track):
     widths = [h["b"][2] for h in hist]
     cxs = [h["c"][0] for h in hist]
     cys = [h["c"][1] for h in hist]
+    fidxs = [h["f"] for h in hist]
 
     curr_h = max(heights[-1], 20.0)
     aspect_ratios = [w / max(h, 1.0) for w, h in zip(widths, heights)]
 
     aspect_curr = float(np.mean(aspect_ratios[-3:]))
     h_drop = (np.mean(heights[:3]) - np.mean(heights[-3:])) / max(np.mean(heights[:3]), 1.0)
-    horiz_v = np.diff(cxs) / curr_h
+
+    # FIX NOTE 5/6: since the producer now decimates frames (skips some
+    # raw frames to keep playback at real speed), consecutive history
+    # entries can be more than 1 source-frame apart. Normalize by the
+    # actual average frame-index gap so speed/jitter thresholds stay
+    # meaningful regardless of the decimation factor.
+    frame_gaps = np.diff(fidxs)
+    avg_step = float(np.mean(frame_gaps)) if len(frame_gaps) else 1.0
+    avg_step = max(avg_step, 1.0)
+
+    horiz_v = (np.diff(cxs) / curr_h) / avg_step
 
     displacement = math.hypot(cxs[-1] - cxs[0], cys[-1] - cys[0]) / curr_h
     speed_mean = float(np.mean(np.abs(horiz_v))) if len(horiz_v) else 0.0
@@ -358,16 +423,17 @@ def classify_taxonomy(f: dict, sensitivity: int):
     threshold (not just the reported confidence)."""
     s = sensitivity / 100.0
 
-    # --- Heat exhaustion / sunstroke: very low net movement with a
-    # persistent, moderate tremor/sway ---
-    heat_jitter_lo = 0.010 - 0.005 * s
-    heat_jitter_hi = 0.030 + 0.025 * s
+    # --- Heat exhaustion / sunstroke: person barely moving overall,
+    # with a roughly upright/standing silhouette. FIX NOTE 6.3: no
+    # longer requires jitter to sit inside a narrow band — a person who
+    # sways slightly AND one who is nearly motionless should both match,
+    # since both are consistent with heat exhaustion. ---
     if (
-        f["speed_mean"] < (0.010 + 0.006 * s)
-        and heat_jitter_lo < f["speed_jitter"] < heat_jitter_hi
-        and f["aspect_curr"] > 0.55
+        f["speed_mean"] < (0.014 + 0.010 * s)
+        and f["displacement"] < (0.14 + 0.08 * s)
+        and 0.25 < f["aspect_curr"] < 0.90
     ):
-        return "sunstroke_heat_exhaustion", min(0.96, 0.72 + 0.22 * s)
+        return "sunstroke_heat_exhaustion", min(0.96, 0.70 + 0.22 * s)
 
     # --- Sudden fall / fall + seizure: rapid height collapse + widened
     # silhouette ---
@@ -436,15 +502,21 @@ def confirm_frames_needed(sensitivity: int) -> int:
 # THREADED WORKER & ENGINE
 # ============================================================================
 
-def frame_producer(video_path, max_frames, frame_queue, target_fps, stop_event):
-    """FIX NOTE 3: paced producer. Reads the source video's own fps and
-    then sleeps between reads so frames are pushed into the queue at
-    roughly `target_fps` (real-time-like), instead of dumping the whole
-    clip into the queue as fast as cv2 can decode it. This is what
-    actually makes playback look smooth/continuous rather than
-    fast-forward-then-jump."""
+def frame_producer(video_path, max_frames, frame_queue, target_fps, src_fps, stop_event):
+    """FIX NOTE 3/5: paced AND decimated producer.
+
+    Every raw frame is read and paced against the SOURCE video's own
+    timeline (1/src_fps per frame) — so total wall-clock time to get
+    through the clip matches its real duration, not a slowed-down
+    version of it. Only every Nth frame (N = src_fps/target_fps) is
+    actually pushed to the queue for display/detection, which is what
+    keeps the render side at a sustainable ~target_fps. This is the
+    combination that gives real-time-feeling playback instead of either
+    slow motion (pacing at target_fps only) or a decode-everything/
+    catch-up jump (no pacing at all)."""
     cap = cv2.VideoCapture(video_path)
-    frame_interval = 1.0 / max(target_fps, 1)
+    skip_every = max(1, round(src_fps / max(target_fps, 1)))
+    frame_interval = 1.0 / max(src_fps, 1)
     count = 0
     next_t = time.time()
     while cap.isOpened() and count < max_frames:
@@ -460,6 +532,9 @@ def frame_producer(video_path, max_frames, frame_queue, target_fps, stop_event):
         if sleep_for > 0:
             time.sleep(sleep_for)
         next_t += frame_interval
+
+        if count % skip_every != 0:
+            continue  # keep the source-timed pace, but don't render/detect this one
 
         try:
             frame_queue.put((count, frame), timeout=1.0)
@@ -521,7 +596,40 @@ def refine_person_box(frame_bgr, bbox, pad=25):
     # pick the highest-confidence detection in the crop
     best = int(np.argmax(weights)) if len(weights) else 0
     rx, ry, rw, rh = rects[best]
-    return (x0 + int(rx), y0 + int(ry), int(rw), int(rh))
+    refined = (x0 + int(rx), y0 + int(ry), int(rw), int(rh))
+
+    # FIX NOTE 7.1: HOG sometimes only picks up part of a person (torso,
+    # shoulders) and returns a box far smaller than the actual motion
+    # blob — that undersized box was a recurring source of visibly-wrong
+    # alert boxes. Reject the refinement if it shrank the box too much
+    # and keep the original motion bbox instead.
+    orig_area = max(bbox[2] * bbox[3], 1)
+    refined_area = refined[2] * refined[3]
+    if refined_area < 0.5 * orig_area:
+        return bbox
+    return refined
+
+
+def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8):
+    """FIX NOTE 7.2: expand a box by a margin before drawing so alert
+    boxes read clearly instead of hugging (or cutting into) the person."""
+    x, y, w, h = bbox
+    H, W = frame_shape[:2]
+    px = max(int(w * pad_ratio), min_pad_px)
+    py = max(int(h * pad_ratio), min_pad_px)
+    nx = max(x - px, 0)
+    ny = max(y - py, 0)
+    nx2 = min(x + w + px, W)
+    ny2 = min(y + h + py, H)
+    return (nx, ny, max(nx2 - nx, 1), max(ny2 - ny, 1))
+
+
+# Minimum tracked-person height (px, at the 480x270 processing resolution)
+# for a track to be eligible for anomaly classification at all. Most
+# reported false alarms were on small/partial blobs — those are also the
+# least trustworthy signal for classification, so gating them out here
+# addresses both problems at once.
+MIN_ALERT_HEIGHT_PX = 42
 
 
 def new_cv_state():
@@ -622,37 +730,48 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
         if f is None:
             continue
 
+        # FIX NOTE 6.2: small/partial detections are excluded from alert
+        # eligibility entirely — still tracked, just not classified —
+        # since these were the dominant source of false alarms and are
+        # inherently the least reliable signal anyway.
+        if tr.bbox[3] < MIN_ALERT_HEIGHT_PX:
+            continue
+
         if tid in fighting_ids:
             cond, conf = "fighting", min(0.93, 0.62 + f["speed_jitter"] * 2.2)
+            confirm_needed_here = confirm_needed + 1  # extra caution on fighting specifically
         else:
             cond, conf = classify_taxonomy(f, sensitivity)
+            confirm_needed_here = confirm_needed
 
         # FIX NOTE 4: only act once the SAME condition has held for
-        # `confirm_needed` consecutive frames — kills one-off noise spikes.
-        confirmed_now = tr.confirm(cond, confirm_needed)
+        # several consecutive frames — kills one-off noise spikes.
+        confirmed_now = tr.confirm(cond, confirm_needed_here)
 
         if confirmed_now and cond in TAXONOMY_RULES:
             info = TAXONOMY_RULES[cond]
             label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
 
-            x, y, w, h = refine_person_box(canvas, tr.bbox)
+            box = refine_person_box(canvas, tr.bbox)
+            x, y, w, h = pad_box(box, canvas.shape)
 
-            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 2)
-            cv2.rectangle(canvas, (x, max(y - 20, 0)), (x + tw + 6, max(y, 20)), (0, 0, 255), -1)
-            cv2.putText(canvas, label, (x + 3, max(y - 5, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(canvas, (x, max(y - 24, 0)), (x + tw + 10, max(y, 24)), (0, 0, 255), -1)
+            cv2.putText(canvas, label, (x + 5, max(y - 7, 17)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
             last_f = state["global_cd"].get(cond, -9999)
             if frame_idx - last_f > 60:
                 state["global_cd"][cond] = frame_idx
                 new_alerts.append((cond, conf))
-        elif tr.pending_cond in TAXONOMY_RULES and tr.pending_count >= confirm_needed:
+        elif tr.pending_cond in TAXONOMY_RULES and tr.pending_count >= confirm_needed_here:
             # Already-confirmed, ongoing condition on a later frame — keep
             # the box visible without re-logging a duplicate alert.
             info = TAXONOMY_RULES[tr.pending_cond]
-            x, y, w, h = refine_person_box(canvas, tr.bbox)
-            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(canvas, info["en"].upper(), (x + 3, max(y - 5, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+            box = refine_person_box(canvas, tr.bbox)
+            x, y, w, h = pad_box(box, canvas.shape)
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            cv2.putText(canvas, info["en"].upper(), (x + 5, max(y - 7, 17)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     return canvas, new_alerts, len(state["tracks"])
 
@@ -780,6 +899,14 @@ def start_stream():
     tfile_path = tf.name
     tf.close()
 
+    # FIX NOTE 5: read the clip's real fps so the producer can pace
+    # against its true timeline instead of assuming a fixed rate.
+    probe = cv2.VideoCapture(tfile_path)
+    src_fps = probe.get(cv2.CAP_PROP_FPS)
+    probe.release()
+    if not src_fps or src_fps <= 1 or src_fps > 120:
+        src_fps = 25.0
+
     # FIX NOTE 3: cap the requested playback speed at RENDER_FPS so the
     # producer can never outpace what the UI paints — this is what keeps
     # the video looking like a continuous live feed instead of
@@ -790,7 +917,7 @@ def start_stream():
     stop_event = threading.Event()
     prod_thread = threading.Thread(
         target=frame_producer,
-        args=(tfile_path, max_f, frame_queue, target_fps, stop_event),
+        args=(tfile_path, max_f, frame_queue, target_fps, src_fps, stop_event),
         daemon=True,
     )
     prod_thread.start()
@@ -802,7 +929,7 @@ def start_stream():
         "tfile_path": tfile_path,
         "w": 480,
         "h": 270,
-        "fps_src": float(target_fps),
+        "fps_src": float(src_fps),
         "sens": sens,
         "zone": selected_zone,
         "proc": 0,
