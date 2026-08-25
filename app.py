@@ -114,6 +114,43 @@ Two changes:
 2) Every drawn alert box now gets a fixed padding margin added around
    it, so boxes read clearly on screen instead of hugging (or cutting
    into) the person.
+
+FIX NOTE 8 (alert boxes appearing on inanimate/static objects):
+The low-motion heat-emergency rule ("barely moving, upright aspect
+ratio") is, by construction, the condition most easily satisfied by a
+non-person foreground blob: a static object left in the scene, a
+parked item, or a shadow/reflection that has stabilized is *literally*
+motionless — which trivially passes speed_mean/displacement thresholds
+that were designed to detect a real person standing still. Nothing in
+the pipeline previously required the blob to actually look like a
+person before firing one of these conditions (the HOG check only ran
+AFTER confirmation, purely to tighten the drawn box — if HOG found no
+person it silently kept the raw motion box instead of rejecting the
+alert). Fix: `verify_person_present()` now GATES confirmation of the
+heat-emergency conditions specifically — it runs OpenCV's pedestrian
+HOG detector on the candidate box and the alert is only allowed to fire
+if HOG actually finds a person-shaped silhouette there. If it doesn't,
+the track's confirmation state is reset (so it has to re-accumulate
+consecutive frames AND re-pass this check, rather than firing on the
+next frame regardless).
+
+FIX NOTE 9 (sunstroke vs. heat exhaustion conflated into one alert):
+`sunstroke_heat_exhaustion` used to cover both "person is essentially
+motionless" (a real collapse/fainting risk) and "person is showing only
+mild sway/low activity" (an early-warning sign) under a single
+condition and a single Critical priority. Split into two distinct
+taxonomy entries with two distinct thresholds and two distinct
+priorities:
+  - `sunstroke_fainting` (Critical) — near-zero movement, the stronger
+    signal, closer to an actual collapse.
+  - `suspected_heat_exhaustion` (High) — mild activity/sway, an
+    early-warning tier rather than an emergency-collapse tier.
+The triage panel is also now sorted by clinical priority first
+(Critical -> High -> Medium -> Low), then by recency within a tier, so
+`sunstroke_fainting` always surfaces above `suspected_heat_exhaustion`,
+which in turn surfaces above routine gait/fatigue alerts like limping —
+instead of pure reverse-chronological order, which could bury a
+Critical alert under a run of Medium ones.
 """
 
 import base64
@@ -232,14 +269,23 @@ st.markdown(
 # ============================================================================
 
 TAXONOMY_RULES = {
-    "sunstroke_heat_exhaustion": {
+    "sunstroke_fainting": {
         "category": "Heat Emergencies & Insolation",
-        "title": "Sunstroke / Extreme Heat Exhaustion",
-        "en": "sunstroke_heat_exhaustion",
+        "title": "Sunstroke / Heat-Induced Fainting",
+        "en": "sunstroke_fainting",
         "priority": "Critical",
         "color": "#DC2626",
         "icon": "☀️",
         "action": "Immediate evacuation to cooling shelter & emergency medical response.",
+    },
+    "suspected_heat_exhaustion": {
+        "category": "Heat Emergencies & Insolation",
+        "title": "Suspected Heat Exhaustion (Early Signs)",
+        "en": "suspected_heat_exhaustion",
+        "priority": "High",
+        "color": "#F97316",
+        "icon": "🌡️",
+        "action": "Dispatch field medic for hydration check & shaded rest; monitor closely.",
     },
     "fighting": {
         "category": "Physical Violence & Assaults",
@@ -307,6 +353,9 @@ TAXONOMY_RULES = {
 }
 
 PRIORITY_COLOR = {"Critical": "#DC2626", "High": "#F97316", "Medium": "#F59E0B", "Low": "#3B82F6"}
+# FIX NOTE 9: explicit rank so the triage panel can sort Critical first,
+# then High, then Medium/Low — instead of pure reverse-chronological.
+PRIORITY_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 
 LOCATIONS = [
     "Pilgrim Corridor 12 (Mashaer Walkway)",
@@ -373,6 +422,14 @@ class Track:
             self.pending_count = 1
         return cond is not None and self.pending_count == needed
 
+    def reject_pending(self):
+        """FIX NOTE 8: used when a confirmed classification fails the
+        person-verification gate — reset so the track has to
+        re-accumulate consecutive frames (and re-pass the gate) instead
+        of firing again on the very next tick with a stale count."""
+        self.pending_cond = None
+        self.pending_count = 0
+
 
 def extract_features(track: Track):
     hist = list(track.history)
@@ -423,17 +480,18 @@ def classify_taxonomy(f: dict, sensitivity: int):
     threshold (not just the reported confidence)."""
     s = sensitivity / 100.0
 
-    # --- Heat exhaustion / sunstroke: person barely moving overall,
-    # with a roughly upright/standing silhouette. FIX NOTE 6.3: no
-    # longer requires jitter to sit inside a narrow band — a person who
-    # sways slightly AND one who is nearly motionless should both match,
-    # since both are consistent with heat exhaustion. ---
-    if (
-        f["speed_mean"] < (0.014 + 0.010 * s)
-        and f["displacement"] < (0.14 + 0.08 * s)
-        and 0.25 < f["aspect_curr"] < 0.90
-    ):
-        return "sunstroke_heat_exhaustion", min(0.96, 0.70 + 0.22 * s)
+    # --- Heat emergencies: person barely moving overall, upright
+    # silhouette. FIX NOTE 9: split into two severity tiers instead of
+    # one combined condition. A near-motionless person is the stronger,
+    # more collapse-like signal -> `sunstroke_fainting` (Critical). A
+    # person showing only mild sway/low activity is an earlier-warning
+    # signal -> `suspected_heat_exhaustion` (High). The stronger check is
+    # tried first since it's the narrower/more specific band. ---
+    upright = 0.25 < f["aspect_curr"] < 0.90
+    if upright and f["speed_mean"] < (0.008 + 0.006 * s) and f["displacement"] < (0.07 + 0.04 * s):
+        return "sunstroke_fainting", min(0.97, 0.75 + 0.20 * s)
+    if upright and f["speed_mean"] < (0.014 + 0.010 * s) and f["displacement"] < (0.14 + 0.08 * s):
+        return "suspected_heat_exhaustion", min(0.88, 0.55 + 0.20 * s)
 
     # --- Sudden fall / fall + seizure: rapid height collapse + widened
     # silhouette ---
@@ -550,11 +608,11 @@ def frame_producer(video_path, max_frames, frame_queue, target_fps, src_fps, sto
 
 
 # ----------------------------------------------------------------------
-# Person-shape refinement: OpenCV's built-in HOG pedestrian detector.
-# Loaded once (no external model download / network access needed).
-# We only run it on a small padded crop around an ALREADY-flagged track's
-# motion bbox — not on every track/every frame — so the box gets fitted
-# to the actual person without materially slowing down normal frames.
+# Person-shape refinement/verification: OpenCV's built-in HOG pedestrian
+# detector. Loaded once (no external model download / network access
+# needed). We only run it on small padded crops around an
+# already-flagged track's motion bbox — not on every track/every frame —
+# so it doesn't materially slow down normal frames.
 # ----------------------------------------------------------------------
 try:
     _HOG = cv2.HOGDescriptor()
@@ -564,34 +622,44 @@ except Exception:
     # to load its default SVM weights) depending on how the package was
     # built/installed. Degrade gracefully instead of crashing the whole
     # app — refine_person_box below just returns the original motion bbox
-    # unchanged when this is None.
+    # unchanged, and verify_person_present below just stops gating, when
+    # this is None.
     _HOG = None
 
 
-def refine_person_box(frame_bgr, bbox, pad=25):
+def _hog_detect(frame_bgr, bbox, pad):
+    """Shared HOG lookup used by both refine_person_box (tightening) and
+    verify_person_present (gating). Returns (rects, weights, roi_origin)
+    or (None, None, None) if the crop is unusable / HOG unavailable."""
     if _HOG is None:
-        return bbox
+        return None, None, None
 
     x, y, w, h = bbox
     H, W = frame_bgr.shape[:2]
     x0, y0 = max(int(x - pad), 0), max(int(y - pad), 0)
     x1, y1 = min(int(x + w + pad), W), min(int(y + h + pad), H)
     if x1 <= x0 or y1 <= y0:
-        return bbox
+        return None, None, None
 
     roi = frame_bgr[y0:y1, x0:x1]
     if roi.shape[0] < 24 or roi.shape[1] < 16:
-        return bbox  # too small for HOG to say anything useful
+        return None, None, None  # too small for HOG to say anything useful
 
     try:
         rects, weights = _HOG.detectMultiScale(
             roi, winStride=(6, 6), padding=(8, 8), scale=1.05
         )
     except Exception:
-        return bbox
+        return None, None, None
 
+    return rects, weights, (x0, y0)
+
+
+def refine_person_box(frame_bgr, bbox, pad=25):
+    rects, weights, origin = _hog_detect(frame_bgr, bbox, pad)
     if rects is None or len(rects) == 0:
         return bbox
+    x0, y0 = origin
 
     # pick the highest-confidence detection in the crop
     best = int(np.argmax(weights)) if len(weights) else 0
@@ -608,6 +676,25 @@ def refine_person_box(frame_bgr, bbox, pad=25):
     if refined_area < 0.5 * orig_area:
         return bbox
     return refined
+
+
+def verify_person_present(frame_bgr, bbox, pad=20):
+    """FIX NOTE 8: gate against inanimate/static objects ("jamadat")
+    firing an alert. This matters most for the heat-emergency
+    conditions, since a completely stationary non-person blob (a static
+    object, a parked item, a stabilized shadow/reflection) trivially
+    satisfies "barely moving" — the same signal a real person standing
+    still would give. Require OpenCV's pedestrian HOG detector to
+    actually find a person-shaped silhouette in the candidate box before
+    letting one of those conditions confirm.
+
+    If this build has no HOG detector available, we can't gate at all —
+    return True so real alerts on this box still fire rather than being
+    silently suppressed forever."""
+    if _HOG is None:
+        return True
+    rects, _weights, _origin = _hog_detect(frame_bgr, bbox, pad)
+    return rects is not None and len(rects) > 0
 
 
 def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8):
@@ -630,6 +717,12 @@ def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8):
 # least trustworthy signal for classification, so gating them out here
 # addresses both problems at once.
 MIN_ALERT_HEIGHT_PX = 42
+
+# Conditions where a stationary/near-stationary blob is itself the
+# trigger signal (FIX NOTE 8) — these are the ones most exposed to
+# firing on an inanimate object, so they're the ones gated by
+# verify_person_present() before being allowed to confirm.
+PERSON_VERIFY_REQUIRED = {"sunstroke_fainting", "suspected_heat_exhaustion"}
 
 
 def new_cv_state():
@@ -749,21 +842,28 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
         confirmed_now = tr.confirm(cond, confirm_needed_here)
 
         if confirmed_now and cond in TAXONOMY_RULES:
-            info = TAXONOMY_RULES[cond]
-            label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
+            # FIX NOTE 8: for the heat-emergency conditions, a stationary
+            # non-person blob can satisfy the motion thresholds just as
+            # easily as a real person standing still — require an actual
+            # person-shaped detection before letting these confirm.
+            if cond in PERSON_VERIFY_REQUIRED and not verify_person_present(canvas, tr.bbox):
+                tr.reject_pending()
+            else:
+                info = TAXONOMY_RULES[cond]
+                label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
 
-            box = refine_person_box(canvas, tr.bbox)
-            x, y, w, h = pad_box(box, canvas.shape)
+                box = refine_person_box(canvas, tr.bbox)
+                x, y, w, h = pad_box(box, canvas.shape)
 
-            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 3)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(canvas, (x, max(y - 24, 0)), (x + tw + 10, max(y, 24)), (0, 0, 255), -1)
-            cv2.putText(canvas, label, (x + 5, max(y - 7, 17)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 3)
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(canvas, (x, max(y - 24, 0)), (x + tw + 10, max(y, 24)), (0, 0, 255), -1)
+                cv2.putText(canvas, label, (x + 5, max(y - 7, 17)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-            last_f = state["global_cd"].get(cond, -9999)
-            if frame_idx - last_f > 60:
-                state["global_cd"][cond] = frame_idx
-                new_alerts.append((cond, conf))
+                last_f = state["global_cd"].get(cond, -9999)
+                if frame_idx - last_f > 60:
+                    state["global_cd"][cond] = frame_idx
+                    new_alerts.append((cond, conf))
         elif tr.pending_cond in TAXONOMY_RULES and tr.pending_count >= confirm_needed_here:
             # Already-confirmed, ongoing condition on a later frame — keep
             # the box visible without re-logging a duplicate alert.
@@ -861,8 +961,21 @@ def draw_triage_html():
     if not st.session_state.alerts:
         return "<div style='color:#94A3B8; padding:1rem; border:1px dashed #334155; border-radius:8px;'>No critical anomalies detected yet. Monitoring live feed...</div>"
 
+    # FIX NOTE 9: order by clinical priority first — sunstroke/fainting
+    # (Critical) above suspected heat exhaustion (High) above routine
+    # gait/fatigue alerts (Medium/Low) — and only fall back to recency
+    # within the same tier, instead of pure reverse-chronological order
+    # which could bury a Critical alert under a run of Medium ones.
+    ordered = sorted(
+        enumerate(st.session_state.alerts),
+        key=lambda pair: (
+            PRIORITY_RANK.get(TAXONOMY_RULES.get(pair[1].condition_key, {}).get("priority", "Low"), 3),
+            -pair[0],
+        ),
+    )
+
     html_out = ""
-    for idx, a in enumerate(reversed(st.session_state.alerts)):
+    for _orig_idx, a in ordered:
         info = TAXONOMY_RULES.get(a.condition_key, TAXONOMY_RULES["sudden_fall"])
         b_color = PRIORITY_COLOR[info["priority"]]
 
