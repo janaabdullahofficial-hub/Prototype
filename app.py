@@ -223,6 +223,15 @@ TAXONOMY_RULES = {
         "icon": "😫",
         "action": "Provide hydration and escort to rest station.",
     },
+    "unusual_movement": {
+        "category": "General Behavioral Anomaly",
+        "title": "Unusual / Unclassified Movement Pattern",
+        "en": "unusual_movement",
+        "priority": "Medium",
+        "color": "#F59E0B",
+        "icon": "❗",
+        "action": "Flag for human review — motion deviates from normal walking baseline but doesn't match a known pattern.",
+    },
 }
 
 PRIORITY_COLOR = {"Critical": "#DC2626", "High": "#F97316", "Medium": "#F59E0B", "Low": "#3B82F6"}
@@ -296,28 +305,90 @@ def extract_features(track: Track):
 
 
 def classify_taxonomy(f: dict, sensitivity: int):
+    """Per-track classification. `sensitivity` now actually widens/loosens
+    every threshold (not just the reported confidence), and a final
+    catch-all rule flags any track whose motion is meaningfully off a
+    normal-walking baseline even if it doesn't match a specific pattern —
+    so unusual behavior doesn't silently pass through undetected."""
     s = sensitivity / 100.0
 
-    if f["speed_mean"] < 0.012 and 0.015 < f["speed_jitter"] < 0.035 and f["aspect_curr"] > 0.65:
-        return "sunstroke_heat_exhaustion", min(0.96, 0.75 + 0.2 * s)
+    # --- Heat exhaustion / sunstroke: very low net movement with a
+    # persistent, moderate tremor/sway ---
+    heat_jitter_lo = 0.010 - 0.005 * s
+    heat_jitter_hi = 0.030 + 0.025 * s
+    if (
+        f["speed_mean"] < (0.010 + 0.006 * s)
+        and heat_jitter_lo < f["speed_jitter"] < heat_jitter_hi
+        and f["aspect_curr"] > 0.55
+    ):
+        return "sunstroke_heat_exhaustion", min(0.96, 0.72 + 0.22 * s)
 
-    if (f["aspect_curr"] > 1.1 and f["h_drop"] > 0.28 * (1.1 - 0.3 * s)):
-        if f["speed_jitter"] > 0.035:
-            return "sudden_fall_followed_by_seizure", min(0.98, 0.80 + 0.15 * s)
-        return "sudden_fall", min(0.95, 0.78 + 0.18 * s)
+    # --- Sudden fall / fall + seizure: rapid height collapse + widened
+    # silhouette ---
+    fall_h_drop_thresh = 0.26 * (1.15 - 0.35 * s)
+    if f["aspect_curr"] > 1.0 and f["h_drop"] > fall_h_drop_thresh:
+        if f["speed_jitter"] > (0.03 - 0.01 * s):
+            return "sudden_fall_followed_by_seizure", min(0.98, 0.78 + 0.18 * s)
+        return "sudden_fall", min(0.95, 0.76 + 0.20 * s)
 
-    if f["aspect_curr"] > 1.15 and f["displacement"] < 0.15:
-        return "lying_immobile", min(0.96, 0.80 + 0.15 * s)
+    # --- Lying immobile: wide/flat silhouette, barely moving ---
+    if f["aspect_curr"] > (1.20 - 0.15 * s) and f["displacement"] < (0.15 + 0.06 * s):
+        return "lying_immobile", min(0.96, 0.78 + 0.18 * s)
 
-    if f["speed_jitter"] > 0.06:
-        if f["speed_jitter"] > 0.1:
-            return "irregular_limping", min(0.90, 0.60 + f["speed_jitter"] * 2.5)
-        return "regular_limping", min(0.88, 0.55 + f["speed_jitter"] * 2.5)
+    # --- Gait irregularities ---
+    limp_hi = 0.095 - 0.025 * s
+    limp_lo = 0.050 - 0.015 * s
+    if f["speed_jitter"] > limp_hi:
+        return "irregular_limping", min(0.92, 0.58 + f["speed_jitter"] * 2.6)
+    if f["speed_jitter"] > limp_lo:
+        return "regular_limping", min(0.88, 0.53 + f["speed_jitter"] * 2.6)
 
-    if f["speed_mean"] < 0.025 and f["h_drop"] > 0.12:
-        return "Exhausted_walking", min(0.85, 0.60 + 0.2 * s)
+    # --- Exhaustion: slow, sagging gait ---
+    if f["speed_mean"] < (0.020 + 0.010 * s) and f["h_drop"] > (0.10 - 0.03 * s):
+        return "Exhausted_walking", min(0.85, 0.58 + 0.22 * s)
+
+    # --- Catch-all: nothing specific matched, but is this motion still
+    # meaningfully "weird" relative to normal walking? Combine the
+    # deviation signals into one score so unusual patterns we didn't
+    # explicitly enumerate still get surfaced for a human to review. ---
+    baseline_dev = (
+        f["speed_jitter"] * 3.2
+        + max(f["h_drop"], 0.0) * 1.3
+        + max(f["aspect_curr"] - 0.55, 0.0) * 0.7
+    )
+    catch_all_thresh = 0.085 - 0.045 * s  # higher sensitivity -> lower bar to flag
+    if baseline_dev > catch_all_thresh:
+        conf = min(0.75, 0.30 + baseline_dev * 1.6)
+        return "unusual_movement", conf
 
     return None, 0.0
+
+
+def detect_fighting_pairs(track_features, sensitivity):
+    """`track_features`: list of (track_id, centroid, height, features).
+    Flags pairs of people who are close together AND both moving
+    erratically at the same time — a proxy for a physical altercation.
+    Returns the set of track ids involved in at least one such pair."""
+    s = sensitivity / 100.0
+    proximity_thresh = 1.5  # in units of average person height
+    jitter_thresh = 0.05 - 0.02 * s
+
+    flagged = set()
+    for i in range(len(track_features)):
+        tid1, c1, h1, feat1 = track_features[i]
+        if feat1 is None or feat1["speed_jitter"] <= jitter_thresh:
+            continue
+        for j in range(i + 1, len(track_features)):
+            tid2, c2, h2, feat2 = track_features[j]
+            if feat2 is None or feat2["speed_jitter"] <= jitter_thresh:
+                continue
+            avg_h = max((h1 + h2) / 2.0, 20.0)
+            dist = math.hypot(c1[0] - c2[0], c1[1] - c2[1]) / avg_h
+            if dist < proximity_thresh:
+                flagged.add(tid1)
+                flagged.add(tid2)
+    return flagged
+
 
 
 # ============================================================================
@@ -335,6 +406,45 @@ def frame_producer(video_path, max_frames, frame_queue):
         count += 1
     cap.release()
     frame_queue.put((None, None))
+
+
+# ----------------------------------------------------------------------
+# Person-shape refinement: OpenCV's built-in HOG pedestrian detector.
+# Loaded once (no external model download / network access needed).
+# We only run it on a small padded crop around an ALREADY-flagged track's
+# motion bbox — not on every track/every frame — so the box gets fitted
+# to the actual person without materially slowing down normal frames.
+# ----------------------------------------------------------------------
+_HOG = cv2.HOGDescriptor()
+_HOG.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+
+def refine_person_box(frame_bgr, bbox, pad=25):
+    x, y, w, h = bbox
+    H, W = frame_bgr.shape[:2]
+    x0, y0 = max(int(x - pad), 0), max(int(y - pad), 0)
+    x1, y1 = min(int(x + w + pad), W), min(int(y + h + pad), H)
+    if x1 <= x0 or y1 <= y0:
+        return bbox
+
+    roi = frame_bgr[y0:y1, x0:x1]
+    if roi.shape[0] < 24 or roi.shape[1] < 16:
+        return bbox  # too small for HOG to say anything useful
+
+    try:
+        rects, weights = _HOG.detectMultiScale(
+            roi, winStride=(6, 6), padding=(8, 8), scale=1.05
+        )
+    except cv2.error:
+        return bbox
+
+    if rects is None or len(rects) == 0:
+        return bbox
+
+    # pick the highest-confidence detection in the crop
+    best = int(np.argmax(weights)) if len(weights) else 0
+    rx, ry, rw, rh = rects[best]
+    return (x0 + int(rx), y0 + int(ry), int(rw), int(rh))
 
 
 def new_cv_state():
@@ -395,25 +505,47 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
 
     new_alerts = []
 
+    # --- Pass 1: extract motion features for every active track once ---
+    track_feats = {}
     for tid, tr in state["tracks"].items():
-        x, y, w, h = tr.bbox
-        f = extract_features(tr)
+        track_feats[tid] = extract_features(tr)
 
-        if f:
+    # --- Pass 2: pairwise fighting check (needs every track's features
+    # available up front, so it has to run before per-track classification) ---
+    feats_list = [
+        (tid, state["tracks"][tid].centroid, state["tracks"][tid].bbox[3], track_feats[tid])
+        for tid in state["tracks"]
+    ]
+    fighting_ids = detect_fighting_pairs(feats_list, sensitivity)
+
+    # --- Pass 3: classify + draw, one track at a time ---
+    for tid, tr in state["tracks"].items():
+        f = track_feats[tid]
+        if f is None:
+            continue
+
+        if tid in fighting_ids:
+            cond, conf = "fighting", min(0.93, 0.62 + f["speed_jitter"] * 2.2)
+        else:
             cond, conf = classify_taxonomy(f, sensitivity)
-            if cond and cond in TAXONOMY_RULES:
-                info = TAXONOMY_RULES[cond]
-                label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
 
-                cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 2)
-                cv2.rectangle(canvas, (x, max(y - 20, 0)), (x + tw + 6, max(y, 20)), (0, 0, 255), -1)
-                cv2.putText(canvas, label, (x + 3, max(y - 5, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        if cond and cond in TAXONOMY_RULES:
+            info = TAXONOMY_RULES[cond]
+            label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
 
-                last_f = state["global_cd"].get(cond, -9999)
-                if frame_idx - last_f > 60:
-                    state["global_cd"][cond] = frame_idx
-                    new_alerts.append((cond, conf))
+            # Tighten the box to the actual person shape, not just
+            # the raw motion-diff blob.
+            x, y, w, h = refine_person_box(canvas, tr.bbox)
+
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 2)
+            cv2.rectangle(canvas, (x, max(y - 20, 0)), (x + tw + 6, max(y, 20)), (0, 0, 255), -1)
+            cv2.putText(canvas, label, (x + 3, max(y - 5, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+
+            last_f = state["global_cd"].get(cond, -9999)
+            if frame_idx - last_f > 60:
+                state["global_cd"][cond] = frame_idx
+                new_alerts.append((cond, conf))
 
     return canvas, new_alerts, len(state["tracks"])
 
@@ -456,7 +588,8 @@ with st.sidebar:
     sens = st.slider("Detection Sensitivity", 20, 100, 75)
 
     st.markdown("---")
-    play_speed = st.slider("Playback Speed (FPS Target)", 10, 60, 25)
+    play_speed = st.slider("Playback Speed (FPS Target)", 10, 60, 25,
+                            help="Effective render rate is capped at ~12 FPS — higher values just make detection run faster, since Streamlit can't smoothly push more frames than that per second over the websocket.")
     max_f = st.slider("Max Processing Frames", 100, 1500, 600, step=50)
 
     st.markdown("---")
@@ -539,16 +672,22 @@ def start_stream():
     )
     prod_thread.start()
 
+    # Streamlit's script-rerun/delta model can't reliably sustain the full
+    # 25-30fps the slider advertises — pushing updates faster than the
+    # websocket can flush just brings back the coalescing/skip problem,
+    # now at the fragment level instead of the placeholder level. Cap the
+    # real push rate at a value that stays smooth end-to-end.
+    MAX_RENDER_FPS = 12
     st.session_state.engine = {
         "queue": frame_queue,
         "cv_state": new_cv_state(),
         "tfile_path": tfile_path,
-        "w": 640,
-        "h": 360,
+        "w": 480,
+        "h": 270,
         "fps_src": 25.0,
         "sens": sens,
         "zone": selected_zone,
-        "frame_delay": 1.0 / max(play_speed, 1),
+        "frame_delay": max(1.0 / max(play_speed, 1), 1.0 / MAX_RENDER_FPS),
         "next_allowed": 0.0,
         "proc": 0,
         "start_t": time.time(),
@@ -556,7 +695,7 @@ def start_stream():
     st.session_state.streaming = True
 
 
-@st.fragment(run_every=0.03)
+@st.fragment(run_every=0.06)
 def live_feed():
     """Runs on its own timer, independent of the rest of the app.
 
@@ -568,9 +707,13 @@ def live_feed():
     just this subtree, which is what makes every frame a real, individually
     flushed update instead of one being coalesced away.
 
-    To avoid a blank flicker on ticks where no new frame is ready yet, we
-    always redraw using the last cached frame/metrics in session_state, and
-    only refresh that cache when a new frame actually arrives.
+    Anti-choppiness strategy: rather than popping exactly one frame per
+    tick (which falls behind and looks laggy/jumpy once the producer
+    thread gets ahead of the render rate), each tick DRAINS every frame
+    currently sitting in the queue. Every drained frame still goes through
+    detection (so no anomaly is missed), but only the CANVAS of the most
+    recent one gets encoded and shown — so the picture on screen is always
+    the freshest available state instead of trailing behind a backlog.
     """
     eng = st.session_state.engine
 
@@ -578,20 +721,25 @@ def live_feed():
         now = time.time()
         if now >= eng["next_allowed"]:
             eng["next_allowed"] = now + eng["frame_delay"]
-            try:
-                frame_idx, raw = eng["queue"].get_nowait()
-            except queue.Empty:
-                frame_idx, raw = -1, None  # no new frame this tick, keep last one
 
-            if frame_idx is None:
-                # Stream finished.
-                st.session_state.streaming = False
-                if eng["tfile_path"] and os.path.exists(eng["tfile_path"]):
-                    try:
-                        os.remove(eng["tfile_path"])
-                    except Exception:
-                        pass
-            elif raw is not None:
+            last_canvas = None
+            last_frame_idx = None
+            last_tracks = 0
+            finished = False
+            drained = 0
+            MAX_DRAIN = 40  # safety cap so one tick can't run forever if wildly behind
+
+            while drained < MAX_DRAIN:
+                try:
+                    frame_idx, raw = eng["queue"].get_nowait()
+                except queue.Empty:
+                    break
+                drained += 1
+
+                if frame_idx is None:
+                    finished = True
+                    break
+
                 raw = cv2.resize(raw, (eng["w"], eng["h"]))
                 frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, eng["cv_state"], eng["sens"])
 
@@ -610,17 +758,30 @@ def live_feed():
                         )
                     )
 
-                ok, jpg_buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                last_canvas = frame_bgr
+                last_frame_idx = frame_idx
+                last_tracks = tracks
+
+            if finished:
+                st.session_state.streaming = False
+                if eng["tfile_path"] and os.path.exists(eng["tfile_path"]):
+                    try:
+                        os.remove(eng["tfile_path"])
+                    except Exception:
+                        pass
+
+            if last_canvas is not None:
+                ok, jpg_buf = cv2.imencode(".jpg", last_canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
                 if ok:
                     st.session_state.last_frame_b64 = base64.b64encode(jpg_buf.tobytes()).decode("utf-8")
 
                 eng["proc"] += 1
                 elapsed = max(time.time() - eng["start_t"], 1e-6)
                 st.session_state.metrics = {
-                    "frame": frame_idx,
-                    "tracks": tracks,
+                    "frame": last_frame_idx,
+                    "tracks": last_tracks,
                     "fps": eng["proc"] / elapsed,
-                    "time": frame_idx / eng["fps_src"],
+                    "time": last_frame_idx / eng["fps_src"],
                 }
 
     # --- Redraw the full layout every tick, from cached state ---
