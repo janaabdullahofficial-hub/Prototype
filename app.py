@@ -198,7 +198,7 @@ TAXONOMY_RULES = {
     },
     "regular_limping": {
         "category": "Abnormal Gait & Fatigue",
-        "title": "Regular Limping Gait Detected",
+        "title": "Steady Limp (Balanced, Consistent Gait)",
         "en": "regular_limping",
         "priority": "Medium",
         "color": "#F59E0B",
@@ -207,7 +207,7 @@ TAXONOMY_RULES = {
     },
     "irregular_limping": {
         "category": "Abnormal Gait & Fatigue",
-        "title": "Irregular / Asymmetric Limping Gait",
+        "title": "Unbalanced / Asymmetric Limp (Losing Steadiness)",
         "en": "irregular_limping",
         "priority": "High",
         "color": "#F97316",
@@ -222,15 +222,6 @@ TAXONOMY_RULES = {
         "color": "#F97316",
         "icon": "😫",
         "action": "Provide hydration and escort to rest station.",
-    },
-    "unusual_movement": {
-        "category": "General Behavioral Anomaly",
-        "title": "Unusual / Unclassified Movement Pattern",
-        "en": "unusual_movement",
-        "priority": "Medium",
-        "color": "#F59E0B",
-        "icon": "❗",
-        "action": "Flag for human review — motion deviates from normal walking baseline but doesn't match a known pattern.",
     },
 }
 
@@ -347,20 +338,6 @@ def classify_taxonomy(f: dict, sensitivity: int):
     if f["speed_mean"] < (0.020 + 0.010 * s) and f["h_drop"] > (0.10 - 0.03 * s):
         return "Exhausted_walking", min(0.85, 0.58 + 0.22 * s)
 
-    # --- Catch-all: nothing specific matched, but is this motion still
-    # meaningfully "weird" relative to normal walking? Combine the
-    # deviation signals into one score so unusual patterns we didn't
-    # explicitly enumerate still get surfaced for a human to review. ---
-    baseline_dev = (
-        f["speed_jitter"] * 3.2
-        + max(f["h_drop"], 0.0) * 1.3
-        + max(f["aspect_curr"] - 0.55, 0.0) * 0.7
-    )
-    catch_all_thresh = 0.085 - 0.045 * s  # higher sensitivity -> lower bar to flag
-    if baseline_dev > catch_all_thresh:
-        conf = min(0.75, 0.30 + baseline_dev * 1.6)
-        return "unusual_movement", conf
-
     return None, 0.0
 
 
@@ -415,11 +392,22 @@ def frame_producer(video_path, max_frames, frame_queue):
 # motion bbox — not on every track/every frame — so the box gets fitted
 # to the actual person without materially slowing down normal frames.
 # ----------------------------------------------------------------------
-_HOG = cv2.HOGDescriptor()
-_HOG.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+try:
+    _HOG = cv2.HOGDescriptor()
+    _HOG.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+except Exception:
+    # Some cloud/headless OpenCV builds don't expose HOGDescriptor (or fail
+    # to load its default SVM weights) depending on how the package was
+    # built/installed. Degrade gracefully instead of crashing the whole
+    # app — refine_person_box below just returns the original motion bbox
+    # unchanged when this is None.
+    _HOG = None
 
 
 def refine_person_box(frame_bgr, bbox, pad=25):
+    if _HOG is None:
+        return bbox
+
     x, y, w, h = bbox
     H, W = frame_bgr.shape[:2]
     x0, y0 = max(int(x - pad), 0), max(int(y - pad), 0)
@@ -435,7 +423,7 @@ def refine_person_box(frame_bgr, bbox, pad=25):
         rects, weights = _HOG.detectMultiScale(
             roi, winStride=(6, 6), padding=(8, 8), scale=1.05
         )
-    except cv2.error:
+    except Exception:
         return bbox
 
     if rects is None or len(rects) == 0:
