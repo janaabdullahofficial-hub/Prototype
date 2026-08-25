@@ -21,8 +21,21 @@ actually gets painted instead of being dropped.
 
 Requires streamlit >= 1.33 (for st.fragment with run_every). If you're
 on an older version: `pip install --upgrade streamlit`.
+
+FIX NOTE 2 (broken image / "Missing file" icon):
+`st.image()` writes each frame through Streamlit's MediaFileManager,
+which serves it as a separate static file fetch. At ~30ms/frame that
+fetch races with MediaFileManager's cleanup of the previous frame's
+file, so the browser sometimes requests a file that's already been
+evicted -> broken image icon + "MediaFileManager: Missing file" in the
+logs (a long-standing Streamlit issue with rapid st.image updates).
+Fix: skip MediaFileManager entirely by inlining each frame as a
+base64 data URI inside the same st.markdown() call that already
+carries the rest of the fragment's HTML — no separate file fetch, so
+no race.
 """
 
+import base64
 import math
 import os
 import queue
@@ -417,8 +430,8 @@ if "streaming" not in st.session_state:
     st.session_state.streaming = False
 if "engine" not in st.session_state:
     st.session_state.engine = None  # holds queue/thread/cv-state for the active run
-if "last_rgb" not in st.session_state:
-    st.session_state.last_rgb = None  # cached last-painted frame, so idle ticks don't flicker
+if "last_frame_b64" not in st.session_state:
+    st.session_state.last_frame_b64 = None  # cached last-painted frame as a data-URI, avoids MediaFileManager races
 
 st.markdown(
     """
@@ -463,7 +476,7 @@ with st.sidebar:
         st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
         st.session_state.streaming = False
         st.session_state.engine = None
-        st.session_state.last_rgb = None
+        st.session_state.last_frame_b64 = None
         st.rerun()
 
 def draw_kpi_html(m):
@@ -597,7 +610,9 @@ def live_feed():
                         )
                     )
 
-                st.session_state.last_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                ok, jpg_buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    st.session_state.last_frame_b64 = base64.b64encode(jpg_buf.tobytes()).decode("utf-8")
 
                 eng["proc"] += 1
                 elapsed = max(time.time() - eng["start_t"], 1e-6)
@@ -613,8 +628,12 @@ def live_feed():
 
     with col_cam:
         st.markdown("##### 📹 Analytical Feed (Continuous Stream)")
-        if st.session_state.last_rgb is not None:
-            st.image(st.session_state.last_rgb, channels="RGB", use_container_width=True)
+        if st.session_state.last_frame_b64 is not None:
+            st.markdown(
+                f'<img src="data:image/jpeg;base64,{st.session_state.last_frame_b64}" '
+                f'style="width:100%;border-radius:10px;display:block;" />',
+                unsafe_allow_html=True,
+            )
         else:
             st.info("Upload a clip and press ▶ Run Stream to begin.")
         st.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
