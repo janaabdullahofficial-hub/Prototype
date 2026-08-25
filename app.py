@@ -151,6 +151,42 @@ The triage panel is also now sorted by clinical priority first
 which in turn surfaces above routine gait/fatigue alerts like limping —
 instead of pure reverse-chronological order, which could bury a
 Critical alert under a run of Medium ones.
+
+FIX NOTE 10 (non-person surfaces still triggering alerts — a wall, an
+on-screen graphic/watermark from editing):
+`verify_person_present()` (FIX NOTE 8) was only being required for the
+two heat-emergency conditions. That was too narrow: a static wall
+segment (lit up by compression noise / a moving shadow / camera
+micro-jitter) or a burned-in editing overlay (a logo, lower-third,
+timestamp) can just as easily land inside the aspect-ratio band for
+"regular_limping" or any other condition as it can for "barely moving,
+upright" — none of that is specific to the heat rule. The gate is now
+required for EVERY condition before an alert is allowed to confirm, not
+just the heat ones — a track only gets to fire an alert at all once
+OpenCV's pedestrian HOG detector actually finds a person-shaped
+silhouette in its box.
+
+FIX NOTE 11 (a person who deliberately sat/lay down to rest was
+classified as "sudden fall followed by seizure" — no seizure occurred):
+Two problems compounded here:
+1) The fall rule only looked at the NET height drop across the whole
+   history window (first-3-avg vs last-3-avg), with no requirement that
+   the drop be fast. A person lowering themselves deliberately to sit
+   or rest produces the same net height change as an actual collapse,
+   just spread over more frames — so it passed the same "h_drop"
+   threshold as a real fall. Added `drop_rate`: the single largest
+   frame-to-frame height decrease (normalized for decimation), which is
+   high for an abrupt collapse and low for a controlled, gradual
+   descent. A fall is now only classified as "sudden" when the drop
+   itself is fast, not merely when the end state is lower.
+2) The seizure sub-classification reused `speed_jitter`, which is
+   horizontal-only and computed over the SAME window that includes the
+   fall/sit-down transition itself — so the ordinary postural wobble of
+   controlledly lowering yourself was indistinguishable from a tremor.
+   Replaced with `tremor`: a two-axis (horizontal + vertical) jitter
+   measured only from the most recent samples (i.e. after the person is
+   already down, not during the transition), which is what an actual
+   convulsive movement looks like and a settled, still person does not.
 """
 
 import base64
@@ -461,10 +497,35 @@ def extract_features(track: Track):
     avg_step = max(avg_step, 1.0)
 
     horiz_v = (np.diff(cxs) / curr_h) / avg_step
+    vert_v = (np.diff(cys) / curr_h) / avg_step
 
     displacement = math.hypot(cxs[-1] - cxs[0], cys[-1] - cys[0]) / curr_h
     speed_mean = float(np.mean(np.abs(horiz_v))) if len(horiz_v) else 0.0
     speed_jitter = float(np.std(horiz_v)) if len(horiz_v) else 0.0
+
+    # FIX NOTE 11.1: how ABRUPT the steepest single-frame height loss was
+    # (normalized for decimation) — high for a real collapse, low for a
+    # person gradually/deliberately lowering themselves to sit or rest,
+    # even though both can reach the same net h_drop over the window.
+    h_diffs = -np.diff(heights)  # positive = height decreased this step
+    if len(h_diffs):
+        base_h = max(np.mean(heights[:3]), 1.0)
+        drop_rate = float(np.max(h_diffs)) / base_h / avg_step
+    else:
+        drop_rate = 0.0
+
+    # FIX NOTE 11.2: two-axis tremor, measured only from the most recent
+    # samples so it reflects the state AFTER any fall/sit transition has
+    # already happened, not the transition's own postural wobble.
+    tail_n = 3
+    horiz_tail = horiz_v[-tail_n:] if len(horiz_v) else horiz_v
+    vert_tail = vert_v[-tail_n:] if len(vert_v) else vert_v
+    tremor = float(
+        math.hypot(
+            float(np.std(horiz_tail)) if len(horiz_tail) else 0.0,
+            float(np.std(vert_tail)) if len(vert_tail) else 0.0,
+        )
+    )
 
     return dict(
         aspect_curr=aspect_curr,
@@ -472,6 +533,8 @@ def extract_features(track: Track):
         displacement=displacement,
         speed_mean=speed_mean,
         speed_jitter=speed_jitter,
+        drop_rate=drop_rate,
+        tremor=tremor,
     )
 
 
@@ -494,10 +557,22 @@ def classify_taxonomy(f: dict, sensitivity: int):
         return "suspected_heat_exhaustion", min(0.88, 0.55 + 0.20 * s)
 
     # --- Sudden fall / fall + seizure: rapid height collapse + widened
-    # silhouette ---
+    # silhouette. FIX NOTE 11.1: net h_drop alone doesn't distinguish a
+    # real collapse from someone deliberately/gradually lowering
+    # themselves to sit or rest — both end up shorter. Require the drop
+    # to also have been ABRUPT (drop_rate) before calling it a fall at
+    # all; a slow, controlled descent no longer qualifies. ---
     fall_h_drop_thresh = 0.26 * (1.15 - 0.35 * s)
-    if f["aspect_curr"] > 1.0 and f["h_drop"] > fall_h_drop_thresh:
-        if f["speed_jitter"] > (0.03 - 0.01 * s):
+    fall_drop_rate_thresh = 0.11 * (1.15 - 0.35 * s)
+    if (
+        f["aspect_curr"] > 1.0
+        and f["h_drop"] > fall_h_drop_thresh
+        and f["drop_rate"] > fall_drop_rate_thresh
+    ):
+        # FIX NOTE 11.2: seizure requires a genuine post-fall tremor
+        # (two-axis, tail-only jitter) — not the one-off wobble of the
+        # fall/sit transition itself, which `tremor` deliberately excludes.
+        if f["tremor"] > (0.05 - 0.015 * s):
             return "sudden_fall_followed_by_seizure", min(0.98, 0.78 + 0.18 * s)
         return "sudden_fall", min(0.95, 0.76 + 0.20 * s)
 
@@ -718,11 +793,13 @@ def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8):
 # addresses both problems at once.
 MIN_ALERT_HEIGHT_PX = 42
 
-# Conditions where a stationary/near-stationary blob is itself the
-# trigger signal (FIX NOTE 8) — these are the ones most exposed to
-# firing on an inanimate object, so they're the ones gated by
-# verify_person_present() before being allowed to confirm.
-PERSON_VERIFY_REQUIRED = {"sunstroke_fainting", "suspected_heat_exhaustion"}
+# FIX NOTE 10: a non-person surface (a wall segment lit up by noise/a
+# moving shadow, a burned-in editing overlay/logo/timestamp) isn't only
+# a risk for the low-motion heat rule — it can land inside the
+# aspect-ratio/motion band for ANY condition. Every condition now
+# requires verify_person_present() before it's allowed to confirm, not
+# just the heat-emergency ones.
+PERSON_VERIFY_REQUIRED = set(TAXONOMY_RULES.keys())
 
 
 def new_cv_state():
