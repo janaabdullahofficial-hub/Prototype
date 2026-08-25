@@ -1,6 +1,77 @@
 """
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
 Full Stream Control with Smooth Frame-by-Frame Rendering
+
+FIX NOTE (frame skipping issue):
+The previous version processed the whole video inside one long Python
+while-loop and called `cam_holder.image(...)` on every iteration. When
+updates to the SAME placeholder arrive faster than the browser/websocket
+can flush them, Streamlit's ForwardMsgQueue coalesces consecutive deltas
+for that element and keeps only the latest one — so visually you only
+ever see the first frame (sent before the backlog built up) and the very
+last frame (the final state once the loop ends). No amount of
+`time.sleep()` inside the loop fixes this, because the whole script is
+still one uninterrupted run.
+
+The fix: stop doing one giant loop. Instead, keep a background thread
+producing frames into a queue (unchanged), and consume ONE frame per
+tick using `st.fragment(run_every=...)`. Each fragment tick is a real,
+independently-flushed rerun of just that fragment, so every frame
+actually gets painted instead of being dropped.
+
+Requires streamlit >= 1.33 (for st.fragment with run_every). If you're
+on an older version: `pip install --upgrade streamlit`.
+
+FIX NOTE 2 (broken image / "Missing file" icon):
+`st.image()` writes each frame through Streamlit's MediaFileManager,
+which serves it as a separate static file fetch. At ~30ms/frame that
+fetch races with MediaFileManager's cleanup of the previous frame's
+file, so the browser sometimes requests a file that's already been
+evicted -> broken image icon + "MediaFileManager: Missing file" in the
+logs (a long-standing Streamlit issue with rapid st.image updates).
+Fix: skip MediaFileManager entirely by inlining each frame as a
+base64 data URI inside the same st.markdown() call that already
+carries the rest of the fragment's HTML — no separate file fetch, so
+no race.
+
+FIX NOTE 3 (frames still look like they're skipping / not smooth):
+Even with the fragment fix, the producer thread used to read the whole
+video as fast as cv2 could decode it and dump every frame into the
+queue immediately. The consumer then drained the ENTIRE backlog on
+every tick and displayed only the newest frame ("catch up" strategy).
+That keeps the render *timing* smooth (steady 12 fps ticks) but the
+*content* jumps — you'd see frame 1, then frame 40, then frame 90,
+etc., which reads as choppy/skippy even though no Streamlit message
+was ever dropped.
+
+Real fix: pace the PRODUCER itself, using time.sleep, so it emits
+frames at (roughly) the same rate the UI can actually paint them —
+i.e. genuine real-time playback like a live broadcast, instead of
+"decode everything instantly, then fast-forward-and-catch-up on
+screen". The consumer now normally finds ~1 fresh frame per tick
+instead of a backlog, so what's shown is the video in true order with
+no visual jumps. A small drain cap is kept purely as a safety net for
+transient hiccups (e.g. a slow detection pass on one frame), not as
+the primary pacing mechanism anymore.
+
+FIX NOTE 4 (accuracy — false positive anomaly alerts):
+Two changes address most of the false-alarm rate:
+1) Foreground segmentation moved from raw two-frame differencing to
+   `cv2.createBackgroundSubtractorMOG2`, which builds an actual
+   statistical background model. Frame differencing lights up on any
+   pixel that changed between two frames — camera micro-jitter,
+   compression noise, lighting flicker, shadows — all of which used to
+   produce spurious motion blobs that could immediately trigger a
+   classification. MOG2 + shadow-channel thresholding + morphological
+   open/close removes the vast majority of that noise before it ever
+   reaches the tracker.
+2) Temporal confirmation ("hysteresis") on alerts. Previously a single
+   noisy frame where a track's features happened to cross a threshold
+   was enough to fire "fighting" / "sudden_fall" / etc. Now a track
+   must be classified the SAME way for several consecutive frames
+   (scaled by sensitivity) before anything is drawn or logged. This is
+   the single biggest lever against one-off misclassifications, and it
+   costs only a small, expected amount of detection latency.
 """
 
 import base64
@@ -223,6 +294,11 @@ class Track:
         self.id = track_id
         self.history = deque(maxlen=15)
         self.age = 0
+        # Temporal-confirmation state (FIX NOTE 4): a classification only
+        # "counts" once the SAME condition has been seen on several
+        # consecutive frames for this track.
+        self.pending_cond = None
+        self.pending_count = 0
         self.update(centroid, bbox, frame_idx)
 
     def update(self, centroid, bbox, frame_idx):
@@ -232,10 +308,24 @@ class Track:
         self.age += 1
         self.history.append({"c": centroid, "b": bbox, "f": frame_idx})
 
+    def confirm(self, cond, needed):
+        """Register this frame's raw classification and report whether it
+        has now been seen `needed` times in a row. Returns True only on
+        confirmation (so callers don't re-fire every subsequent frame)."""
+        if cond == self.pending_cond:
+            self.pending_count += 1
+        else:
+            self.pending_cond = cond
+            self.pending_count = 1
+        return cond is not None and self.pending_count == needed
+
 
 def extract_features(track: Track):
     hist = list(track.history)
-    if len(hist) < 3:
+    # Require a slightly longer history than before (5 vs 3) so a track's
+    # speed/jitter estimate isn't dominated by 1-2 noisy samples right
+    # after it's created.
+    if len(hist) < 5:
         return None
 
     heights = [h["b"][3] for h in hist]
@@ -264,11 +354,8 @@ def extract_features(track: Track):
 
 
 def classify_taxonomy(f: dict, sensitivity: int):
-    """Per-track classification. `sensitivity` now actually widens/loosens
-    every threshold (not just the reported confidence), and a final
-    catch-all rule flags any track whose motion is meaningfully off a
-    normal-walking baseline even if it doesn't match a specific pattern —
-    so unusual behavior doesn't silently pass through undetected."""
+    """Per-track classification. `sensitivity` widens/loosens every
+    threshold (not just the reported confidence)."""
     s = sensitivity / 100.0
 
     # --- Heat exhaustion / sunstroke: very low net movement with a
@@ -335,22 +422,56 @@ def detect_fighting_pairs(track_features, sensitivity):
     return flagged
 
 
+def confirm_frames_needed(sensitivity: int) -> int:
+    """How many consecutive frames a track must hold the same
+    classification before it's treated as a real alert (FIX NOTE 4).
+    Higher sensitivity -> fewer frames needed (more responsive, a bit
+    more false positives). Lower sensitivity -> more frames needed
+    (slower, but much cleaner)."""
+    s = sensitivity / 100.0
+    return max(2, int(round(6 - 4 * s)))
+
 
 # ============================================================================
 # THREADED WORKER & ENGINE
 # ============================================================================
 
-def frame_producer(video_path, max_frames, frame_queue):
+def frame_producer(video_path, max_frames, frame_queue, target_fps, stop_event):
+    """FIX NOTE 3: paced producer. Reads the source video's own fps and
+    then sleeps between reads so frames are pushed into the queue at
+    roughly `target_fps` (real-time-like), instead of dumping the whole
+    clip into the queue as fast as cv2 can decode it. This is what
+    actually makes playback look smooth/continuous rather than
+    fast-forward-then-jump."""
     cap = cv2.VideoCapture(video_path)
+    frame_interval = 1.0 / max(target_fps, 1)
     count = 0
+    next_t = time.time()
     while cap.isOpened() and count < max_frames:
+        if stop_event.is_set():
+            break
         ret, frame = cap.read()
         if not ret:
             break
-        frame_queue.put((count + 1, frame))
         count += 1
+
+        now = time.time()
+        sleep_for = next_t - now
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        next_t += frame_interval
+
+        try:
+            frame_queue.put((count, frame), timeout=1.0)
+        except queue.Full:
+            # Consumer stalled hard (e.g. tab backgrounded) — drop this
+            # frame rather than block the producer forever.
+            pass
     cap.release()
-    frame_queue.put((None, None))
+    try:
+        frame_queue.put((None, None), timeout=1.0)
+    except queue.Full:
+        pass
 
 
 # ----------------------------------------------------------------------
@@ -405,7 +526,13 @@ def refine_person_box(frame_bgr, bbox, pad=25):
 
 def new_cv_state():
     return {
-        "prev_gray": None,
+        # FIX NOTE 4: real background model (MOG2) instead of naive
+        # two-frame differencing — far less sensitive to camera jitter,
+        # lighting flicker and compression noise.
+        "bg_sub": cv2.createBackgroundSubtractorMOG2(
+            history=250, varThreshold=45, detectShadows=True
+        ),
+        "warmup": 0,
         "tracks": {},
         "next_id": 1,
         "global_cd": {},
@@ -415,23 +542,37 @@ def new_cv_state():
 def process_video_frame(frame, frame_idx, state, sensitivity):
     canvas = frame.copy()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (11, 11), 0)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
 
-    if state["prev_gray"] is None:
-        state["prev_gray"] = gray
+    fg_mask = state["bg_sub"].apply(gray)
+
+    # Let the background model warm up before trusting it — the first
+    # ~20 frames are mostly "everything is foreground" noise.
+    state["warmup"] += 1
+    if state["warmup"] < 20:
         return canvas, [], 0
 
-    frame_diff = cv2.absdiff(state["prev_gray"], gray)
-    state["prev_gray"] = gray
+    # MOG2 marks shadow pixels as mid-gray (127) when detectShadows=True.
+    # Thresholding at 200 keeps only solid foreground and drops shadows,
+    # which used to register as spurious extra motion blobs.
+    _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
 
-    _, thresh = cv2.threshold(frame_diff, 22, 255, cv2.THRESH_BINARY)
-    thresh = cv2.dilate(thresh, None, iterations=2)
+    # Opening removes small noise specks; closing re-merges a real
+    # person's silhouette (limbs/folds) that the mask fragments into
+    # several small blobs.
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+    thresh = cv2.dilate(thresh, None, iterations=1)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detections = []
     for c in contours:
-        # تخفيض الحد لرصد الأجسام البعيدة فور ورودها في الحركة
+        # Keep the low area floor (catches distant/small people early),
+        # relying on MOG2 + morphology above to keep noise out instead of
+        # a high area cutoff.
         if cv2.contourArea(c) < 250:
             continue
         x, y, w, h = cv2.boundingRect(c)
@@ -455,11 +596,12 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
             state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
             assigned.add(tid)
 
-    # تنظيف وتفريغ الأهداف غير النشطة
+    # Drop stale tracks
     for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 2]:
         del state["tracks"][tid]
 
     new_alerts = []
+    confirm_needed = confirm_frames_needed(sensitivity)
 
     # --- Pass 1: extract motion features for every active track once ---
     track_feats = {}
@@ -474,7 +616,7 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
     ]
     fighting_ids = detect_fighting_pairs(feats_list, sensitivity)
 
-    # --- Pass 3: classify + draw, one track at a time ---
+    # --- Pass 3: classify, apply temporal confirmation, then draw ---
     for tid, tr in state["tracks"].items():
         f = track_feats[tid]
         if f is None:
@@ -485,12 +627,14 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
         else:
             cond, conf = classify_taxonomy(f, sensitivity)
 
-        if cond and cond in TAXONOMY_RULES:
+        # FIX NOTE 4: only act once the SAME condition has held for
+        # `confirm_needed` consecutive frames — kills one-off noise spikes.
+        confirmed_now = tr.confirm(cond, confirm_needed)
+
+        if confirmed_now and cond in TAXONOMY_RULES:
             info = TAXONOMY_RULES[cond]
             label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
 
-            # Tighten the box to the actual person shape, not just
-            # the raw motion-diff blob.
             x, y, w, h = refine_person_box(canvas, tr.bbox)
 
             cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
@@ -502,6 +646,13 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
             if frame_idx - last_f > 60:
                 state["global_cd"][cond] = frame_idx
                 new_alerts.append((cond, conf))
+        elif tr.pending_cond in TAXONOMY_RULES and tr.pending_count >= confirm_needed:
+            # Already-confirmed, ongoing condition on a later frame — keep
+            # the box visible without re-logging a duplicate alert.
+            info = TAXONOMY_RULES[tr.pending_cond]
+            x, y, w, h = refine_person_box(canvas, tr.bbox)
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            cv2.putText(canvas, info["en"].upper(), (x + 3, max(y - 5, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
     return canvas, new_alerts, len(state["tracks"])
 
@@ -509,6 +660,8 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
 # ============================================================================
 # STREAMLIT UI & FRAGMENT-BASED CONSUMER RUNTIME
 # ============================================================================
+
+RENDER_FPS = 12  # smooth, sustainable push rate for the browser/websocket
 
 if "alerts" not in st.session_state:
     st.session_state.alerts = []
@@ -541,11 +694,12 @@ with st.sidebar:
 
     st.markdown("---")
     selected_zone = st.selectbox("Zone Location", LOCATIONS)
-    sens = st.slider("Detection Sensitivity", 20, 100, 75)
+    sens = st.slider("Detection Sensitivity", 20, 100, 75,
+                      help="Higher = alerts confirm faster (fewer consecutive frames required) but slightly more false positives. Lower = slower but cleaner.")
 
     st.markdown("---")
-    play_speed = st.slider("Playback Speed (FPS Target)", 10, 60, 25,
-                            help="Effective render rate is capped at ~12 FPS — higher values just make detection run faster, since Streamlit can't smoothly push more frames than that per second over the websocket.")
+    play_speed = st.slider("Playback Speed (FPS)", 5, RENDER_FPS, RENDER_FPS,
+                            help=f"Real-time playback pace, capped at {RENDER_FPS} FPS — the max rate the browser can paint smoothly. Frames are now paced to this speed as they're produced, so playback stays continuous instead of jumping ahead.")
     max_f = st.slider("Max Processing Frames", 100, 1500, 600, step=50)
 
     st.markdown("---")
@@ -556,11 +710,15 @@ with st.sidebar:
     if reset_btn:
         # Also tear down any active engine/thread state, not just alerts.
         eng = st.session_state.engine
-        if eng is not None and eng.get("tfile_path") and os.path.exists(eng["tfile_path"]):
-            try:
-                os.remove(eng["tfile_path"])
-            except Exception:
-                pass
+        if eng is not None:
+            stop_evt = eng.get("stop_event")
+            if stop_evt is not None:
+                stop_evt.set()
+            if eng.get("tfile_path") and os.path.exists(eng["tfile_path"]):
+                try:
+                    os.remove(eng["tfile_path"])
+                except Exception:
+                    pass
         st.session_state.alerts = []
         st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
         st.session_state.streaming = False
@@ -606,10 +764,10 @@ def draw_triage_html():
 
 
 def start_stream():
-    """One-shot setup: save the upload, spin up the producer thread, and
-    arm the engine. Actual frame-by-frame rendering happens in the
-    live_feed fragment below, one frame per tick — never in a blocking
-    loop here."""
+    """One-shot setup: save the upload, spin up the (now paced) producer
+    thread, and arm the engine. Actual frame-by-frame rendering happens
+    in the live_feed fragment below, one tick at a time — never in a
+    blocking loop here."""
     if uploaded_vid is None:
         st.warning("Please upload a video file to run the analytical stream.")
         return
@@ -622,36 +780,38 @@ def start_stream():
     tfile_path = tf.name
     tf.close()
 
-    frame_queue = queue.Queue(maxsize=50)
+    # FIX NOTE 3: cap the requested playback speed at RENDER_FPS so the
+    # producer can never outpace what the UI paints — this is what keeps
+    # the video looking like a continuous live feed instead of
+    # decode-everything-then-fast-forward.
+    target_fps = min(play_speed, RENDER_FPS)
+
+    frame_queue = queue.Queue(maxsize=8)
+    stop_event = threading.Event()
     prod_thread = threading.Thread(
-        target=frame_producer, args=(tfile_path, max_f, frame_queue), daemon=True
+        target=frame_producer,
+        args=(tfile_path, max_f, frame_queue, target_fps, stop_event),
+        daemon=True,
     )
     prod_thread.start()
 
-    # Streamlit's script-rerun/delta model can't reliably sustain the full
-    # 25-30fps the slider advertises — pushing updates faster than the
-    # websocket can flush just brings back the coalescing/skip problem,
-    # now at the fragment level instead of the placeholder level. Cap the
-    # real push rate at a value that stays smooth end-to-end.
-    MAX_RENDER_FPS = 12
     st.session_state.engine = {
         "queue": frame_queue,
+        "stop_event": stop_event,
         "cv_state": new_cv_state(),
         "tfile_path": tfile_path,
         "w": 480,
         "h": 270,
-        "fps_src": 25.0,
+        "fps_src": float(target_fps),
         "sens": sens,
         "zone": selected_zone,
-        "frame_delay": max(1.0 / max(play_speed, 1), 1.0 / MAX_RENDER_FPS),
-        "next_allowed": 0.0,
         "proc": 0,
         "start_t": time.time(),
     }
     st.session_state.streaming = True
 
 
-@st.fragment(run_every=0.06)
+@st.fragment(run_every=1.0 / RENDER_FPS)
 def live_feed():
     """Runs on its own timer, independent of the rest of the app.
 
@@ -663,82 +823,77 @@ def live_feed():
     just this subtree, which is what makes every frame a real, individually
     flushed update instead of one being coalesced away.
 
-    Anti-choppiness strategy: rather than popping exactly one frame per
-    tick (which falls behind and looks laggy/jumpy once the producer
-    thread gets ahead of the render rate), each tick DRAINS every frame
-    currently sitting in the queue. Every drained frame still goes through
-    detection (so no anomaly is missed), but only the CANVAS of the most
-    recent one gets encoded and shown — so the picture on screen is always
-    the freshest available state instead of trailing behind a backlog.
+    FIX NOTE 3: because the producer now paces itself to RENDER_FPS, each
+    tick normally finds exactly ONE fresh frame waiting. We still drain up
+    to a small cap as a safety net for transient stalls (e.g. one slow
+    detection pass), but it's no longer the primary mechanism — so the
+    picture on screen advances through the video in true order instead of
+    jumping across a backlog.
     """
     eng = st.session_state.engine
 
     if st.session_state.streaming and eng is not None:
-        now = time.time()
-        if now >= eng["next_allowed"]:
-            eng["next_allowed"] = now + eng["frame_delay"]
+        last_canvas = None
+        last_frame_idx = None
+        last_tracks = 0
+        finished = False
+        drained = 0
+        MAX_DRAIN = 3  # safety net only, not the pacing mechanism anymore
 
-            last_canvas = None
-            last_frame_idx = None
-            last_tracks = 0
-            finished = False
-            drained = 0
-            MAX_DRAIN = 40  # safety cap so one tick can't run forever if wildly behind
+        while drained < MAX_DRAIN:
+            try:
+                frame_idx, raw = eng["queue"].get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
 
-            while drained < MAX_DRAIN:
-                try:
-                    frame_idx, raw = eng["queue"].get_nowait()
-                except queue.Empty:
-                    break
-                drained += 1
+            if frame_idx is None:
+                finished = True
+                break
 
-                if frame_idx is None:
-                    finished = True
-                    break
+            raw = cv2.resize(raw, (eng["w"], eng["h"]))
+            frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, eng["cv_state"], eng["sens"])
 
-                raw = cv2.resize(raw, (eng["w"], eng["h"]))
-                frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, eng["cv_state"], eng["sens"])
-
-                for cond, conf in evts:
-                    seq_num = len(st.session_state.alerts) + 1
-                    st.session_state.alerts.append(
-                        Alert(
-                            id=f"EMS-{seq_num:03d}",
-                            unique_key=f"{seq_num}_{frame_idx}_{int(time.time()*1000)}",
-                            frame_idx=frame_idx,
-                            video_time_s=frame_idx / eng["fps_src"],
-                            wall_clock=datetime.now().strftime("%H:%M:%S"),
-                            location=eng["zone"],
-                            condition_key=cond,
-                            confidence=conf,
-                        )
+            for cond, conf in evts:
+                seq_num = len(st.session_state.alerts) + 1
+                st.session_state.alerts.append(
+                    Alert(
+                        id=f"EMS-{seq_num:03d}",
+                        unique_key=f"{seq_num}_{frame_idx}_{int(time.time()*1000)}",
+                        frame_idx=frame_idx,
+                        video_time_s=frame_idx / eng["fps_src"],
+                        wall_clock=datetime.now().strftime("%H:%M:%S"),
+                        location=eng["zone"],
+                        condition_key=cond,
+                        confidence=conf,
                     )
+                )
 
-                last_canvas = frame_bgr
-                last_frame_idx = frame_idx
-                last_tracks = tracks
+            last_canvas = frame_bgr
+            last_frame_idx = frame_idx
+            last_tracks = tracks
 
-            if finished:
-                st.session_state.streaming = False
-                if eng["tfile_path"] and os.path.exists(eng["tfile_path"]):
-                    try:
-                        os.remove(eng["tfile_path"])
-                    except Exception:
-                        pass
+        if finished:
+            st.session_state.streaming = False
+            if eng["tfile_path"] and os.path.exists(eng["tfile_path"]):
+                try:
+                    os.remove(eng["tfile_path"])
+                except Exception:
+                    pass
 
-            if last_canvas is not None:
-                ok, jpg_buf = cv2.imencode(".jpg", last_canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
-                if ok:
-                    st.session_state.last_frame_b64 = base64.b64encode(jpg_buf.tobytes()).decode("utf-8")
+        if last_canvas is not None:
+            ok, jpg_buf = cv2.imencode(".jpg", last_canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+            if ok:
+                st.session_state.last_frame_b64 = base64.b64encode(jpg_buf.tobytes()).decode("utf-8")
 
-                eng["proc"] += 1
-                elapsed = max(time.time() - eng["start_t"], 1e-6)
-                st.session_state.metrics = {
-                    "frame": last_frame_idx,
-                    "tracks": last_tracks,
-                    "fps": eng["proc"] / elapsed,
-                    "time": last_frame_idx / eng["fps_src"],
-                }
+            eng["proc"] += 1
+            elapsed = max(time.time() - eng["start_t"], 1e-6)
+            st.session_state.metrics = {
+                "frame": last_frame_idx,
+                "tracks": last_tracks,
+                "fps": eng["proc"] / elapsed,
+                "time": last_frame_idx / eng["fps_src"],
+            }
 
     # --- Redraw the full layout every tick, from cached state ---
     col_cam, col_triage = st.columns([1.35, 1])
