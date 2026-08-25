@@ -417,6 +417,8 @@ if "streaming" not in st.session_state:
     st.session_state.streaming = False
 if "engine" not in st.session_state:
     st.session_state.engine = None  # holds queue/thread/cv-state for the active run
+if "last_rgb" not in st.session_state:
+    st.session_state.last_rgb = None  # cached last-painted frame, so idle ticks don't flicker
 
 st.markdown(
     """
@@ -461,19 +463,8 @@ with st.sidebar:
         st.session_state.metrics = {"frame": 0, "tracks": 0, "fps": 0.0, "time": 0.0}
         st.session_state.streaming = False
         st.session_state.engine = None
+        st.session_state.last_rgb = None
         st.rerun()
-
-col_cam, col_triage = st.columns([1.35, 1])
-
-with col_cam:
-    st.markdown("##### 📹 Analytical Feed (Continuous Stream)")
-    cam_holder = st.empty()
-    kpi_holder = st.empty()
-
-with col_triage:
-    st.markdown("##### 🚨 Live Triage & Dispatch Log")
-    triage_holder = st.empty()
-
 
 def draw_kpi_html(m):
     return f"""
@@ -555,81 +546,87 @@ def start_stream():
 @st.fragment(run_every=0.03)
 def live_feed():
     """Runs on its own timer, independent of the rest of the app.
-    Each tick paints AT MOST one new frame, so every frame is a real,
-    individually-flushed update instead of being coalesced away."""
-    if not st.session_state.streaming or st.session_state.engine is None:
-        return
 
+    IMPORTANT: a fragment cannot write into placeholders/columns that were
+    created outside of it (Streamlit raises
+    'Fragments cannot write to elements outside of their container').
+    So this fragment builds its ENTIRE layout (both columns) itself, every
+    tick. That's the intended fragment pattern: each tick fully re-renders
+    just this subtree, which is what makes every frame a real, individually
+    flushed update instead of one being coalesced away.
+
+    To avoid a blank flicker on ticks where no new frame is ready yet, we
+    always redraw using the last cached frame/metrics in session_state, and
+    only refresh that cache when a new frame actually arrives.
+    """
     eng = st.session_state.engine
-    now = time.time()
-    if now < eng["next_allowed"]:
-        return  # not time for the next frame yet — keep current one on screen
-    eng["next_allowed"] = now + eng["frame_delay"]
 
-    try:
-        frame_idx, raw = eng["queue"].get_nowait()
-    except queue.Empty:
-        return  # producer hasn't delivered the next frame yet, try next tick
-
-    if frame_idx is None:
-        # Stream finished.
-        st.session_state.streaming = False
-        if eng["tfile_path"] and os.path.exists(eng["tfile_path"]):
+    if st.session_state.streaming and eng is not None:
+        now = time.time()
+        if now >= eng["next_allowed"]:
+            eng["next_allowed"] = now + eng["frame_delay"]
             try:
-                os.remove(eng["tfile_path"])
-            except Exception:
-                pass
-        kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
-        triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
-        return
+                frame_idx, raw = eng["queue"].get_nowait()
+            except queue.Empty:
+                frame_idx, raw = -1, None  # no new frame this tick, keep last one
 
-    raw = cv2.resize(raw, (eng["w"], eng["h"]))
-    frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, eng["cv_state"], eng["sens"])
+            if frame_idx is None:
+                # Stream finished.
+                st.session_state.streaming = False
+                if eng["tfile_path"] and os.path.exists(eng["tfile_path"]):
+                    try:
+                        os.remove(eng["tfile_path"])
+                    except Exception:
+                        pass
+            elif raw is not None:
+                raw = cv2.resize(raw, (eng["w"], eng["h"]))
+                frame_bgr, evts, tracks = process_video_frame(raw, frame_idx, eng["cv_state"], eng["sens"])
 
-    for cond, conf in evts:
-        seq_num = len(st.session_state.alerts) + 1
-        st.session_state.alerts.append(
-            Alert(
-                id=f"EMS-{seq_num:03d}",
-                unique_key=f"{seq_num}_{frame_idx}_{int(time.time()*1000)}",
-                frame_idx=frame_idx,
-                video_time_s=frame_idx / eng["fps_src"],
-                wall_clock=datetime.now().strftime("%H:%M:%S"),
-                location=eng["zone"],
-                condition_key=cond,
-                confidence=conf,
-            )
-        )
+                for cond, conf in evts:
+                    seq_num = len(st.session_state.alerts) + 1
+                    st.session_state.alerts.append(
+                        Alert(
+                            id=f"EMS-{seq_num:03d}",
+                            unique_key=f"{seq_num}_{frame_idx}_{int(time.time()*1000)}",
+                            frame_idx=frame_idx,
+                            video_time_s=frame_idx / eng["fps_src"],
+                            wall_clock=datetime.now().strftime("%H:%M:%S"),
+                            location=eng["zone"],
+                            condition_key=cond,
+                            confidence=conf,
+                        )
+                    )
 
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                st.session_state.last_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-    eng["proc"] += 1
-    elapsed = max(time.time() - eng["start_t"], 1e-6)
+                eng["proc"] += 1
+                elapsed = max(time.time() - eng["start_t"], 1e-6)
+                st.session_state.metrics = {
+                    "frame": frame_idx,
+                    "tracks": tracks,
+                    "fps": eng["proc"] / elapsed,
+                    "time": frame_idx / eng["fps_src"],
+                }
 
-    st.session_state.metrics = {
-        "frame": frame_idx,
-        "tracks": tracks,
-        "fps": eng["proc"] / elapsed,
-        "time": frame_idx / eng["fps_src"],
-    }
+    # --- Redraw the full layout every tick, from cached state ---
+    col_cam, col_triage = st.columns([1.35, 1])
 
-    # 🟢 عرض الإطار الحالي — تحديث حقيقي مستقل في كل نبضة
-    cam_holder.image(rgb, channels="RGB", use_container_width=True)
-    kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
+    with col_cam:
+        st.markdown("##### 📹 Analytical Feed (Continuous Stream)")
+        if st.session_state.last_rgb is not None:
+            st.image(st.session_state.last_rgb, channels="RGB", use_container_width=True)
+        else:
+            st.info("Upload a clip and press ▶ Run Stream to begin.")
+        st.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
 
-    # سجل التنبيهات نحدثه أقل تكرارًا فقط لتخفيف العبء (ما يؤثر على الفيديو نفسه)
-    if eng["proc"] % 3 == 0 or evts:
-        triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
+    with col_triage:
+        st.markdown("##### 🚨 Live Triage & Dispatch Log")
+        st.markdown(draw_triage_html(), unsafe_allow_html=True)
 
 
 if start_btn:
     start_stream()
 
-# Idle placeholders before any stream has run.
-if st.session_state.engine is None:
-    kpi_holder.markdown(draw_kpi_html(st.session_state.metrics), unsafe_allow_html=True)
-    triage_holder.markdown(draw_triage_html(), unsafe_allow_html=True)
-
 # Always mount the fragment; it self-schedules via run_every and simply
-# no-ops when streaming is False.
+# redraws from cached state when idle (streaming == False).
 live_feed()
