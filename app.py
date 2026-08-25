@@ -187,6 +187,24 @@ Two problems compounded here:
    measured only from the most recent samples (i.e. after the person is
    already down, not during the transition), which is what an actual
    convulsive movement looks like and a settled, still person does not.
+FIX NOTE 12 (alert boxes far too large — usually on inanimate objects):
+A real person's motion blob is bounded by how big a person can actually
+be in frame; the oversized boxes were consistently on non-person cases
+(a lit-up wall segment, a large lighting-change/shadow region, a big
+static area absorbed unevenly by the background model) that can span a
+much larger area than any single person ever would. Two caps were
+added:
+1) At detection time, a contour is now rejected — never even becomes a
+   track — if its area, height, or width exceeds a plausible
+   single-person size relative to the frame (`MAX_CONTOUR_AREA_RATIO`,
+   `MAX_PERSON_HEIGHT_RATIO`, `MAX_PERSON_WIDTH_RATIO`). This is the
+   main fix, since it stops an oversized blob from ever being tracked
+   or classified at all.
+2) As a safety net, a track is also excluded from alert eligibility if
+   its box has since grown past the same height limit (mirrors the
+   existing `MIN_ALERT_HEIGHT_PX` floor with a matching ceiling), and
+   `pad_box()` now caps its added margin in pixels so the padding step
+   itself can't balloon an already-large box further.
 """
 
 import base64
@@ -772,13 +790,15 @@ def verify_person_present(frame_bgr, bbox, pad=20):
     return rects is not None and len(rects) > 0
 
 
-def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8):
+def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8, max_pad_px=40):
     """FIX NOTE 7.2: expand a box by a margin before drawing so alert
-    boxes read clearly instead of hugging (or cutting into) the person."""
+    boxes read clearly instead of hugging (or cutting into) the person.
+    FIX NOTE 12: the margin is also capped in absolute pixels so this
+    step can't itself balloon an already-large box even further."""
     x, y, w, h = bbox
     H, W = frame_shape[:2]
-    px = max(int(w * pad_ratio), min_pad_px)
-    py = max(int(h * pad_ratio), min_pad_px)
+    px = min(max(int(w * pad_ratio), min_pad_px), max_pad_px)
+    py = min(max(int(h * pad_ratio), min_pad_px), max_pad_px)
     nx = max(x - px, 0)
     ny = max(y - py, 0)
     nx2 = min(x + w + px, W)
@@ -792,6 +812,15 @@ def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8):
 # least trustworthy signal for classification, so gating them out here
 # addresses both problems at once.
 MIN_ALERT_HEIGHT_PX = 42
+
+# FIX NOTE 12: matching ceiling — a blob this tall/wide relative to the
+# frame is no longer a plausible single person; it reads as a large
+# static/lighting artifact instead. Ratios are relative to the
+# processing frame's own dimensions so they hold regardless of
+# resolution.
+MAX_CONTOUR_AREA_RATIO = 0.18   # a person's motion blob shouldn't fill more than ~18% of the frame
+MAX_PERSON_HEIGHT_RATIO = 0.85  # relative to frame height
+MAX_PERSON_WIDTH_RATIO = 0.55   # relative to frame height (a standing person is taller than wide)
 
 # FIX NOTE 10: a non-person surface (a wall segment lit up by noise/a
 # moving shadow, a burned-in editing overlay/logo/timestamp) isn't only
@@ -846,14 +875,26 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # FIX NOTE 12: plausible single-person size ceiling, relative to this
+    # frame's own dimensions.
+    frame_h, frame_w = frame.shape[:2]
+    max_area = MAX_CONTOUR_AREA_RATIO * frame_h * frame_w
+    max_h = MAX_PERSON_HEIGHT_RATIO * frame_h
+    max_w = MAX_PERSON_WIDTH_RATIO * frame_h
+
     detections = []
     for c in contours:
         # Keep the low area floor (catches distant/small people early),
         # relying on MOG2 + morphology above to keep noise out instead of
         # a high area cutoff.
-        if cv2.contourArea(c) < 250:
+        area = cv2.contourArea(c)
+        if area < 250:
             continue
         x, y, w, h = cv2.boundingRect(c)
+        # FIX NOTE 12: reject implausibly large blobs outright — never
+        # even becomes a track — instead of only capping it later.
+        if area > max_area or h > max_h or w > max_w:
+            continue
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h)))
 
     assigned = set()
@@ -900,11 +941,13 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
         if f is None:
             continue
 
-        # FIX NOTE 6.2: small/partial detections are excluded from alert
-        # eligibility entirely — still tracked, just not classified —
-        # since these were the dominant source of false alarms and are
-        # inherently the least reliable signal anyway.
-        if tr.bbox[3] < MIN_ALERT_HEIGHT_PX:
+        # FIX NOTE 6.2 / 12: small/partial detections are excluded from
+        # alert eligibility entirely (least reliable signal), and so are
+        # blobs that have grown past a plausible single-person size
+        # (safety net matching the detection-time cap above) — still
+        # tracked either way, just not classified.
+        max_alert_h = MAX_PERSON_HEIGHT_RATIO * canvas.shape[0]
+        if tr.bbox[3] < MIN_ALERT_HEIGHT_PX or tr.bbox[3] > max_alert_h:
             continue
 
         if tid in fighting_ids:
