@@ -1,38 +1,6 @@
 """
 Baseer – AI Early Multi-Modal Anomaly Detection & Triage Command Center
 Full Stream Control with Smooth Frame-by-Frame Rendering
-
-FIX NOTE (frame skipping issue):
-The previous version processed the whole video inside one long Python
-while-loop and called `cam_holder.image(...)` on every iteration. When
-updates to the SAME placeholder arrive faster than the browser/websocket
-can flush them, Streamlit's ForwardMsgQueue coalesces consecutive deltas
-for that element and keeps only the latest one — so visually you only
-ever see the first frame (sent before the backlog built up) and the very
-last frame (the final state once the loop ends). No amount of
-`time.sleep()` inside the loop fixes this, because the whole script is
-still one uninterrupted run.
-
-The fix: stop doing one giant loop. Instead, keep a background thread
-producing frames into a queue (unchanged), and consume ONE frame per
-tick using `st.fragment(run_every=...)`. Each fragment tick is a real,
-independently-flushed rerun of just that fragment, so every frame
-actually gets painted instead of being dropped.
-
-Requires streamlit >= 1.33 (for st.fragment with run_every). If you're
-on an older version: `pip install --upgrade streamlit`.
-
-FIX NOTE 2 (broken image / "Missing file" icon):
-`st.image()` writes each frame through Streamlit's MediaFileManager,
-which serves it as a separate static file fetch. At ~30ms/frame that
-fetch races with MediaFileManager's cleanup of the previous frame's
-file, so the browser sometimes requests a file that's already been
-evicted -> broken image icon + "MediaFileManager: Missing file" in the
-logs (a long-standing Streamlit issue with rapid st.image updates).
-Fix: skip MediaFileManager entirely by inlining each frame as a
-base64 data URI inside the same st.markdown() call that already
-carries the rest of the fragment's HTML — no separate file fetch, so
-no race.
 """
 
 import base64
