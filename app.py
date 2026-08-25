@@ -187,6 +187,7 @@ Two problems compounded here:
    measured only from the most recent samples (i.e. after the person is
    already down, not during the transition), which is what an actual
    convulsive movement looks like and a settled, still person does not.
+
 FIX NOTE 12 (alert boxes far too large — usually on inanimate objects):
 A real person's motion blob is bounded by how big a person can actually
 be in frame; the oversized boxes were consistently on non-person cases
@@ -227,6 +228,48 @@ Two changes:
    score, not just the presence of any detection — a low-confidence hit
    on a repetitive texture no longer counts as "found a person" on its
    own; combined with (1), it now has to happen consistently.
+
+FIX NOTE 14 (a person's track was dying and restarting mid-frame):
+Tracks used to be deleted the moment they went 2 frames without a
+matched detection, and re-matching was pure nearest-centroid at a
+fixed pixel radius. In a crowd, a brief occlusion, a temporary blob
+merge/split, or one frame where the foreground mask fragmented was
+enough to kill the track — and when the same person reappeared a
+moment later they got a brand-new track ID, resetting `history`,
+confirmation state, AND all the accumulated person-liveness evidence
+from FIX NOTE 13. That's the opposite of "track this person the whole
+time they're in frame". Fixed with:
+1) `Track.missed`: instead of deleting on the first gap, a track now
+   "coasts" — stays alive, keeping all of its state — for up to
+   `MAX_MISSED_FRAMES` frames with no matched detection, and is only
+   dropped once it's really been gone that long.
+2) `Track.predicted_centroid()`: while coasting, matching uses the
+   track's last known velocity to predict where it should be next,
+   instead of just its last-seen position, so a detection that
+   reappears a few pixels away (as expected motion, not a jump) is
+   still re-matched to the SAME track/ID rather than spawning a new one.
+3) The matching radius now scales with the track's own height (a
+   person-relative distance, like the jump-rejection check already
+   used) instead of a flat pixel constant, so small/close and
+   large/far tracks are matched with sensible tolerances instead of
+   one-size-fits-all.
+
+FIX NOTE 15 (a real fallen/lying person could fail the person-verification
+gate and have their alert silently dropped):
+`verify_person_present()` (FIX NOTE 8/10/13) relies on OpenCV's default
+pedestrian HOG detector, which is trained on upright, standing/walking
+silhouettes. A person who has actually fallen or is lying immobile —
+exactly the cases `sudden_fall`, `lying_immobile`, and
+`sunstroke_fainting` exist to catch — produces a wide/flat box that the
+detector was never trained to recognize, so the liveness gate could
+reject a genuine emergency as "not a person" and silently drop it via
+`reject_pending()`. Fixed by adding a second HOG pass, tried only for
+wide/flat boxes (width >= ~0.9x height, i.e. the shape a lying person
+actually produces): the crop is rotated 90 degrees before detection, so
+a horizontal silhouette presents to the detector the way an upright one
+normally would. This keeps the anti-inanimate-object gate just as
+strict for actual static objects while no longer penalizing the exact
+poses the most critical alerts depend on.
 """
 
 import base64
@@ -461,6 +504,10 @@ class Track:
         self.id = track_id
         self.history = deque(maxlen=15)
         self.age = 0
+        # FIX NOTE 14: consecutive frames with no matched detection. The
+        # track stays alive ("coasts") while this is below
+        # MAX_MISSED_FRAMES, instead of being deleted on the first gap.
+        self.missed = 0
         # Temporal-confirmation state (FIX NOTE 4): a classification only
         # "counts" once the SAME condition has been seen on several
         # consecutive frames for this track.
@@ -483,6 +530,10 @@ class Track:
         self.update(centroid, bbox, frame_idx)
 
     def update(self, centroid, bbox, frame_idx):
+        # FIX NOTE 14: a real detection matched this frame -> no longer
+        # coasting.
+        self.missed = 0
+
         # FIX NOTE 6.1: reject implausible one-frame jumps (usually a
         # crowd blob merging/splitting into a different track) instead of
         # letting them masquerade as real high-speed/jitter motion.
@@ -508,6 +559,21 @@ class Track:
         self.last_seen = frame_idx
         self.age += 1
         self.history.append({"c": centroid, "b": bbox, "f": frame_idx})
+
+    def predicted_centroid(self):
+        """FIX NOTE 14: while coasting (no detection this frame), predict
+        where the track should be next using its last known velocity, so
+        it can still be re-matched to a detection that reappears a few
+        pixels away instead of only ever matching at its exact last-seen
+        spot. Falls back to the last known centroid if there isn't
+        enough history yet to estimate a velocity."""
+        if len(self.history) < 2:
+            return self.centroid
+        c_now = self.history[-1]["c"]
+        c_prev = self.history[-2]["c"]
+        vx, vy = c_now[0] - c_prev[0], c_now[1] - c_prev[1]
+        steps = self.missed + 1
+        return (c_now[0] + vx * steps, c_now[1] + vy * steps)
 
     def confirm(self, cond, needed):
         """Register this frame's raw classification and report whether it
@@ -810,6 +876,40 @@ def _hog_detect(frame_bgr, bbox, pad):
     return rects, weights, (x0, y0)
 
 
+def _hog_detect_rotated(frame_bgr, bbox, pad):
+    """FIX NOTE 15: the default pedestrian HOG detector expects an
+    upright standing/walking silhouette, so it can miss a fallen/lying
+    person's box outright (width >= height). Rotate the padded crop 90
+    degrees before running HOG so a horizontal silhouette presents to
+    the detector the way an upright one normally would. Returns
+    (rects, weights) or (None, None) if the crop is unusable/HOG is
+    unavailable."""
+    if _HOG is None:
+        return None, None
+
+    x, y, w, h = bbox
+    H, W = frame_bgr.shape[:2]
+    x0, y0 = max(int(x - pad), 0), max(int(y - pad), 0)
+    x1, y1 = min(int(x + w + pad), W), min(int(y + h + pad), H)
+    if x1 <= x0 or y1 <= y0:
+        return None, None
+
+    roi = frame_bgr[y0:y1, x0:x1]
+    if roi.shape[0] < 16 or roi.shape[1] < 24:
+        return None, None  # too small for HOG to say anything useful
+
+    rotated = cv2.rotate(roi, cv2.ROTATE_90_CLOCKWISE)
+
+    try:
+        rects, weights = _HOG.detectMultiScale(
+            rotated, winStride=(6, 6), padding=(8, 8), scale=1.05
+        )
+    except Exception:
+        return None, None
+
+    return rects, weights
+
+
 def refine_person_box(frame_bgr, bbox, pad=25):
     rects, weights, origin = _hog_detect(frame_bgr, bbox, pad)
     if rects is None or len(rects) == 0:
@@ -852,15 +952,31 @@ def verify_person_present(frame_bgr, bbox, pad=20, min_weight=0.55):
     over the track's life (see Track.person_checks) instead of being
     trusted on one snapshot.
 
+    FIX NOTE 15: the plain upright HOG pass above can miss a genuinely
+    fallen/lying person (wide/flat box), which would wrongly fail this
+    gate for exactly the most critical alerts (sudden_fall,
+    lying_immobile, sunstroke_fainting). For wide/flat boxes only, also
+    try a second HOG pass on a 90-degree-rotated crop before giving up —
+    upright boxes already got a fair shot from the first pass, so this
+    extra cost is only paid for the shapes where it's actually needed.
+
     If this build has no HOG detector available, we can't gate at all —
     return True so real alerts on this box still fire rather than being
     silently suppressed forever."""
     if _HOG is None:
         return True
+
     rects, weights, _origin = _hog_detect(frame_bgr, bbox, pad)
-    if rects is None or len(rects) == 0:
-        return False
-    return bool(len(weights) and float(np.max(weights)) >= min_weight)
+    if rects is not None and len(rects) and float(np.max(weights)) >= min_weight:
+        return True
+
+    x, y, w, h = bbox
+    if w >= h * 0.9:
+        rects_r, weights_r = _hog_detect_rotated(frame_bgr, bbox, pad)
+        if rects_r is not None and len(rects_r) and float(np.max(weights_r)) >= min_weight:
+            return True
+
+    return False
 
 
 def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8, max_pad_px=40):
@@ -907,6 +1023,13 @@ PERSON_HIT_RATIO_REQUIRED = 0.66  # fraction of those samples that must be posit
 # FIX NOTE 10/13: every condition — not just the heat-emergency ones —
 # now requires accumulated person-liveness evidence (see Track.person_*
 # and PERSON_CHECK_* above) before it's allowed to confirm at all.
+
+# FIX NOTE 14: how many consecutive frames a track can go without a
+# matched detection before it's actually considered "gone" and dropped.
+# Kept generous enough to survive a brief occlusion/blob-merge in a
+# crowd without losing the track's identity, history, and accumulated
+# person-liveness evidence.
+MAX_MISSED_FRAMES = 10
 
 
 def new_cv_state():
@@ -975,14 +1098,23 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
             continue
         detections.append(((x + w / 2, y + h / 2), (x, y, w, h)))
 
+    # FIX NOTE 14: match against each track's PREDICTED position (its
+    # last known position projected forward by its velocity and how long
+    # it's been coasting), not just its last-seen spot — and scale the
+    # acceptance radius by the track's own size, widening slightly the
+    # longer it's been missing, so a person who reappears after a brief
+    # occlusion/merge is re-matched to their SAME track/ID instead of
+    # spawning a new one.
     assigned = set()
     for (cx, cy), (x, y, w, h) in detections:
-        best_id, best_d = None, 100.0
+        best_id, best_d = None, None
         for tid, tr in state["tracks"].items():
             if tid in assigned:
                 continue
-            d = math.hypot(tr.centroid[0] - cx, tr.centroid[1] - cy)
-            if d < best_d:
+            pc = tr.predicted_centroid()
+            d = math.hypot(pc[0] - cx, pc[1] - cy)
+            max_d = max(tr.bbox[3], 20.0) * (1.1 + 0.15 * tr.missed)
+            if d < max_d and (best_d is None or d < best_d):
                 best_d, best_id = d, tid
         if best_id is not None:
             state["tracks"][best_id].update((cx, cy), (x, y, w, h), frame_idx)
@@ -993,8 +1125,18 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
             state["tracks"][tid] = Track(tid, (cx, cy), (x, y, w, h), frame_idx)
             assigned.add(tid)
 
-    # Drop stale tracks
-    for tid in [t for t, obj in state["tracks"].items() if frame_idx - obj.last_seen > 2]:
+    # FIX NOTE 14: a track that found no matching detection this frame is
+    # marked as "missed" (coasting) rather than deleted immediately — its
+    # history, confirmation state, and accumulated person-liveness
+    # evidence all stay intact in case it's re-matched on a following
+    # frame.
+    for tid, tr in state["tracks"].items():
+        if tid not in assigned:
+            tr.missed += 1
+
+    # Drop tracks only once they've genuinely been gone long enough —
+    # not on the very first missed frame.
+    for tid in [t for t, obj in state["tracks"].items() if obj.missed > MAX_MISSED_FRAMES]:
         del state["tracks"][tid]
 
     new_alerts = []
@@ -1015,6 +1157,12 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
 
     # --- Pass 3: classify, apply temporal confirmation, then draw ---
     for tid, tr in state["tracks"].items():
+        # FIX NOTE 14: a coasting track (missed this frame, no fresh
+        # bbox) has nothing new to classify or draw this tick — skip it,
+        # but it's still alive and will resume normally once re-matched.
+        if tr.missed > 0:
+            continue
+
         f = track_feats[tid]
         if f is None:
             continue
