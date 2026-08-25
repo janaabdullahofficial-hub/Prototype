@@ -270,6 +270,36 @@ a horizontal silhouette presents to the detector the way an upright one
 normally would. This keeps the anti-inanimate-object gate just as
 strict for actual static objects while no longer penalizing the exact
 poses the most critical alerts depend on.
+
+FIX NOTE 16 (sunstroke vs. heat exhaustion weren't split on the right
+clinical signal): the two heat conditions used to be distinguished
+purely by HOW LITTLE the person moved (near-still -> sunstroke, mild
+sway -> heat exhaustion). That's not the actual clinical distinction
+requested: sunstroke (ضربة شمس) is defined by NEUROLOGICAL signs —
+delirium, loss of consciousness, or convulsions — while heat exhaustion
+(إجهاد حراري) is a MUSCULAR/FATIGUE sign — an unsteady gait/limp that
+may end in a stumble or fall, but the person stays conscious and mobile
+through it. Reworked `classify_taxonomy`'s heat-emergency section
+end-to-end around that distinction:
+1) Two new per-track features in `extract_features`: `tail_speed`
+   (activity in only the most recent samples — used to tell "fell and
+   kept moving" apart from "fell and went still") and
+   `direction_reversals` (how often horizontal direction flips relative
+   to real net progress — a proxy for confused/disoriented wandering
+   vs. purposeful, if unsteady, movement).
+2) `sunstroke_fainting` (Critical) now fires on any of three
+   neurological signs: a genuine tremor/convulsion, near-total stillness
+   (loss of consciousness), or high direction-reversal with little net
+   progress (delirium) — checked in that order since they're
+   increasingly less specific and the more urgent pattern should win if
+   more than one happens to overlap.
+3) `suspected_heat_exhaustion` (High) now specifically requires a limp
+   signature (elevated speed_jitter) combined with an abrupt height-drop
+   (a stumble/fall) AND continued post-drop movement (`tail_speed` above
+   a "still conscious" floor) — i.e. limped, stumbled, kept moving. If
+   the person instead went still after the stumble, that's caught by the
+   `sunstroke_fainting` near-stillness check above instead, since staying
+   conscious is exactly what's supposed to separate the two tiers.
 """
 
 import base64
@@ -673,6 +703,25 @@ def extract_features(track: Track):
         )
     )
 
+    # FIX NOTE 16.1: activity right AFTER the most recent moment — used
+    # to tell "fell/stumbled and kept moving" (conscious) apart from
+    # "fell and went still" (loss of consciousness), independent of the
+    # fall/stumble's own transition.
+    tail_speed = float(np.mean(np.abs(horiz_v[-2:]))) if len(horiz_v) else 0.0
+
+    # FIX NOTE 16.2: how often the horizontal direction flips, as a
+    # fraction of steps. A limp still generally makes forward progress
+    # (moderate jitter, but net displacement keeps growing); confused/
+    # disoriented wandering flips direction constantly while going
+    # nowhere (real motion, but little net displacement) — this is the
+    # proxy used for delirium.
+    signs = np.sign(horiz_v)
+    nonzero = signs[signs != 0]
+    if len(nonzero) > 1:
+        direction_reversals = float(np.sum(nonzero[1:] != nonzero[:-1])) / (len(nonzero) - 1)
+    else:
+        direction_reversals = 0.0
+
     return dict(
         aspect_curr=aspect_curr,
         h_drop=h_drop,
@@ -681,6 +730,8 @@ def extract_features(track: Track):
         speed_jitter=speed_jitter,
         drop_rate=drop_rate,
         tremor=tremor,
+        tail_speed=tail_speed,
+        direction_reversals=direction_reversals,
     )
 
 
@@ -689,25 +740,61 @@ def classify_taxonomy(f: dict, sensitivity: int):
     threshold (not just the reported confidence)."""
     s = sensitivity / 100.0
 
-    # --- Heat emergencies: person barely moving overall, upright
-    # silhouette. FIX NOTE 9: split into two severity tiers instead of
-    # one combined condition. A near-motionless person is the stronger,
-    # more collapse-like signal -> `sunstroke_fainting` (Critical). A
-    # person showing only mild sway/low activity is an earlier-warning
-    # signal -> `suspected_heat_exhaustion` (High). The stronger check is
-    # tried first since it's the narrower/more specific band. ---
-    upright = 0.25 < f["aspect_curr"] < 0.90
-    if upright and f["speed_mean"] < (0.008 + 0.006 * s) and f["displacement"] < (0.07 + 0.04 * s):
-        return "sunstroke_fainting", min(0.97, 0.75 + 0.20 * s)
-    if upright and f["speed_mean"] < (0.014 + 0.010 * s) and f["displacement"] < (0.14 + 0.08 * s):
-        return "suspected_heat_exhaustion", min(0.88, 0.55 + 0.20 * s)
+    # === FIX NOTE 16: heat-emergency severity, keyed on the actual
+    # clinical distinction requested: sunstroke (ضربة شمس) is a
+    # NEUROLOGICAL sign — delirium, loss of consciousness, or
+    # convulsions. Heat exhaustion (إجهاد حراري) is a MUSCULAR/FATIGUE
+    # sign — an unsteady gait/limp that may end in a stumble or fall, but
+    # the person stays conscious and mobile through it. The neurological
+    # checks run first (most specific/most urgent should win if more
+    # than one condition happens to overlap in the same window). ===
 
-    # --- Sudden fall / fall + seizure: rapid height collapse + widened
-    # silhouette. FIX NOTE 11.1: net h_drop alone doesn't distinguish a
-    # real collapse from someone deliberately/gradually lowering
-    # themselves to sit or rest — both end up shorter. Require the drop
-    # to also have been ABRUPT (drop_rate) before calling it a fall at
-    # all; a slow, controlled descent no longer qualifies. ---
+    # --- Convulsions -> sunstroke (Critical), regardless of posture ---
+    tremor_thresh = 0.05 - 0.015 * s
+    if f["tremor"] > tremor_thresh:
+        return "sunstroke_fainting", min(0.97, 0.80 + 0.15 * s)
+
+    # --- Loss of consciousness -> sunstroke (Critical): essentially
+    # motionless, whether fainted still standing or collapsed and
+    # stayed down. Posture doesn't matter here, only that real movement
+    # has actually stopped.
+    near_still = f["speed_mean"] < (0.009 + 0.006 * s) and f["displacement"] < (0.08 + 0.04 * s)
+    if near_still:
+        return "sunstroke_fainting", min(0.97, 0.75 + 0.20 * s)
+
+    # --- Delirium -> sunstroke (Critical): moving, but incoherently —
+    # frequent direction reversals with little real net progress. A limp
+    # still generally makes forward progress; this doesn't.
+    delirium_reversal_thresh = 0.55 - 0.10 * s
+    if (
+        f["direction_reversals"] > delirium_reversal_thresh
+        and f["speed_mean"] > (0.010 + 0.004 * s)
+        and f["displacement"] < (0.16 + 0.06 * s)
+    ):
+        return "sunstroke_fainting", min(0.93, 0.68 + 0.20 * s)
+
+    # --- Limp progressing into a stumble/fall the person stays
+    # conscious through -> heat exhaustion (High): a limping jitter
+    # signature AND an abrupt height-drop (stumble/fall) happened in the
+    # same window, but the person kept moving afterward (tail_speed
+    # above a "still conscious" floor) instead of going still — staying
+    # conscious is exactly what rules this OUT of the sunstroke tier
+    # above.
+    limp_signature = f["speed_jitter"] > (0.045 - 0.015 * s)
+    heat_fall_h_drop_thresh = 0.22 * (1.15 - 0.35 * s)
+    heat_fall_drop_rate_thresh = 0.09 * (1.15 - 0.35 * s)
+    stumbled = f["h_drop"] > heat_fall_h_drop_thresh and f["drop_rate"] > heat_fall_drop_rate_thresh
+    stayed_conscious = f["tail_speed"] > (0.018 + 0.006 * s)
+    if limp_signature and stumbled and stayed_conscious:
+        return "suspected_heat_exhaustion", min(0.88, 0.58 + 0.20 * s)
+
+    # --- Sudden fall / fall + seizure (general, not heat-specific):
+    # rapid height collapse + widened silhouette. FIX NOTE 11.1: net
+    # h_drop alone doesn't distinguish a real collapse from someone
+    # deliberately/gradually lowering themselves to sit or rest — both
+    # end up shorter. Require the drop to also have been ABRUPT
+    # (drop_rate) before calling it a fall at all; a slow, controlled
+    # descent no longer qualifies. ---
     fall_h_drop_thresh = 0.26 * (1.15 - 0.35 * s)
     fall_drop_rate_thresh = 0.11 * (1.15 - 0.35 * s)
     if (
@@ -983,7 +1070,7 @@ def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8, max_pad_px=40):
     """FIX NOTE 7.2: expand a box by a margin before drawing so alert
     boxes read clearly instead of hugging (or cutting into) the person.
     FIX NOTE 12: the margin is also capped in absolute pixels so this
-    step can't itself balloon an already-large box even further."""
+    step can't itself balloon an already-large box further."""
     x, y, w, h = bbox
     H, W = frame_shape[:2]
     px = min(max(int(w * pad_ratio), min_pad_px), max_pad_px)
