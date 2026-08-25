@@ -205,6 +205,28 @@ added:
    existing `MIN_ALERT_HEIGHT_PX` floor with a matching ceiling), and
    `pad_box()` now caps its added margin in pixels so the padding step
    itself can't balloon an already-large box further.
+
+FIX NOTE 13 (still alerting on inanimate objects; wants liveness checked
+BEFORE anything else, tracked continuously the whole time an object is
+in frame):
+Two changes:
+1) `verify_person_present()` used to run ONCE, at the exact instant a
+   track's motion pattern finished its consecutive-frame confirmation —
+   a single HOG snapshot, which a patterned/textured surface (a
+   railing, a tiled wall, a gate) can occasionally pass by coincidence.
+   Person-liveness is now sampled repeatedly across the track's ENTIRE
+   time in view (throttled to a handful of samples for cost, via
+   `Track.person_checks`/`person_hits`), and a track only gets to fire
+   an alert once a required minimum number of those samples have come
+   back positive by a required majority (`PERSON_CHECK_MIN_SAMPLES`,
+   `PERSON_HIT_RATIO_REQUIRED`) — i.e. the object has to keep looking
+   like a person across many separate looks, not just one lucky frame.
+   If the sample budget runs out without a confident majority, the
+   pending classification is dropped instead of firing.
+2) `verify_person_present()` also now requires a minimum HOG confidence
+   score, not just the presence of any detection — a low-confidence hit
+   on a repetitive texture no longer counts as "found a person" on its
+   own; combined with (1), it now has to happen consistently.
 """
 
 import base64
@@ -444,6 +466,20 @@ class Track:
         # consecutive frames for this track.
         self.pending_cond = None
         self.pending_count = 0
+        # FIX NOTE 13: person-liveness evidence, accumulated across the
+        # WHOLE time this track has existed in frame — not just checked
+        # once at the instant a classification happens to confirm. See
+        # process_video_frame for how this is gathered and required.
+        self.person_checks = 0
+        self.person_hits = 0
+        # A motion-pattern classification that has finished its
+        # consecutive-frame confirmation and is now just waiting on
+        # enough accumulated person-evidence before it's allowed to fire.
+        self.awaiting_cond = None
+        self.awaiting_conf = 0.0
+        # The condition that has actually fired (motion-confirmed AND
+        # person-verified) and is still ongoing this frame.
+        self.confirmed_cond = None
         self.update(centroid, bbox, frame_idx)
 
     def update(self, centroid, bbox, frame_idx):
@@ -458,6 +494,14 @@ class Track:
                 self.history.clear()
                 self.pending_cond = None
                 self.pending_count = 0
+                # FIX NOTE 13: a jump this large usually means the track
+                # identity itself is questionable (blob merge/split) —
+                # any liveness evidence gathered so far no longer
+                # reliably describes "this" object, so start over.
+                self.person_checks = 0
+                self.person_hits = 0
+                self.awaiting_cond = None
+                self.confirmed_cond = None
 
         self.centroid = centroid
         self.bbox = bbox
@@ -483,6 +527,24 @@ class Track:
         of firing again on the very next tick with a stale count."""
         self.pending_cond = None
         self.pending_count = 0
+        self.awaiting_cond = None
+        self.confirmed_cond = None
+
+    def record_person_check(self, is_person: bool):
+        """FIX NOTE 13: log one liveness sample for this track. Called
+        repeatedly over the track's life (throttled by a sample cap in
+        process_video_frame) so the eventual person/not-person call is
+        based on the object's behavior across many frames, not a single
+        snapshot that a patterned wall or a logo could get lucky on."""
+        self.person_checks += 1
+        if is_person:
+            self.person_hits += 1
+
+    def person_confidence_ok(self, min_samples: int, min_ratio: float) -> bool:
+        if self.person_checks < min_samples:
+            return False
+        return (self.person_hits / self.person_checks) >= min_ratio
+
 
 
 def extract_features(track: Track):
@@ -771,7 +833,7 @@ def refine_person_box(frame_bgr, bbox, pad=25):
     return refined
 
 
-def verify_person_present(frame_bgr, bbox, pad=20):
+def verify_person_present(frame_bgr, bbox, pad=20, min_weight=0.55):
     """FIX NOTE 8: gate against inanimate/static objects ("jamadat")
     firing an alert. This matters most for the heat-emergency
     conditions, since a completely stationary non-person blob (a static
@@ -781,13 +843,24 @@ def verify_person_present(frame_bgr, bbox, pad=20):
     actually find a person-shaped silhouette in the candidate box before
     letting one of those conditions confirm.
 
+    FIX NOTE 13: also require a minimum HOG confidence (`min_weight`),
+    not just any detection. A repetitive/textured surface (patterned
+    wall, railing, gate) can occasionally produce a low-confidence HOG
+    hit purely by texture coincidence; a real person's detection score
+    is typically well above that. This alone isn't perfectly reliable on
+    a single frame — which is exactly why it's now sampled repeatedly
+    over the track's life (see Track.person_checks) instead of being
+    trusted on one snapshot.
+
     If this build has no HOG detector available, we can't gate at all —
     return True so real alerts on this box still fire rather than being
     silently suppressed forever."""
     if _HOG is None:
         return True
-    rects, _weights, _origin = _hog_detect(frame_bgr, bbox, pad)
-    return rects is not None and len(rects) > 0
+    rects, weights, _origin = _hog_detect(frame_bgr, bbox, pad)
+    if rects is None or len(rects) == 0:
+        return False
+    return bool(len(weights) and float(np.max(weights)) >= min_weight)
 
 
 def pad_box(bbox, frame_shape, pad_ratio=0.28, min_pad_px=8, max_pad_px=40):
@@ -822,13 +895,18 @@ MAX_CONTOUR_AREA_RATIO = 0.18   # a person's motion blob shouldn't fill more tha
 MAX_PERSON_HEIGHT_RATIO = 0.85  # relative to frame height
 MAX_PERSON_WIDTH_RATIO = 0.55   # relative to frame height (a standing person is taller than wide)
 
-# FIX NOTE 10: a non-person surface (a wall segment lit up by noise/a
-# moving shadow, a burned-in editing overlay/logo/timestamp) isn't only
-# a risk for the low-motion heat rule — it can land inside the
-# aspect-ratio/motion band for ANY condition. Every condition now
-# requires verify_person_present() before it's allowed to confirm, not
-# just the heat-emergency ones.
-PERSON_VERIFY_REQUIRED = set(TAXONOMY_RULES.keys())
+# FIX NOTE 13: liveness sampling — a track only gets to fire an alert
+# once it's been checked for "is this actually a person" across several
+# separate frames during its time in view (not just once, at whichever
+# instant the motion pattern happened to confirm), and the majority of
+# those checks came back positive.
+PERSON_CHECK_MIN_SAMPLES = 3     # need at least this many samples before a verdict counts
+PERSON_CHECK_MAX_SAMPLES = 6     # stop sampling after this many (cost control once evidence is enough)
+PERSON_HIT_RATIO_REQUIRED = 0.66  # fraction of those samples that must be positive
+
+# FIX NOTE 10/13: every condition — not just the heat-emergency ones —
+# now requires accumulated person-liveness evidence (see Track.person_*
+# and PERSON_CHECK_* above) before it's allowed to confirm at all.
 
 
 def new_cv_state():
@@ -961,16 +1039,31 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
         # several consecutive frames — kills one-off noise spikes.
         confirmed_now = tr.confirm(cond, confirm_needed_here)
 
+        # FIX NOTE 13: sample liveness evidence every frame this track is
+        # alert-eligible (throttled by a sample cap for cost), across its
+        # WHOLE time in view — not only at the instant a classification
+        # happens to confirm. This is what lets a track that entered
+        # frame as (say) a wall-shadow get judged on many looks instead
+        # of the one unlucky/lucky frame where thresholds lined up.
+        if tr.person_checks < PERSON_CHECK_MAX_SAMPLES:
+            tr.record_person_check(verify_person_present(canvas, tr.bbox))
+
+        # A pending motion-pattern classification that no longer matches
+        # what we were waiting to fire is stale — drop it so it doesn't
+        # block a future, different condition from ever being awaited.
+        if tr.awaiting_cond is not None and tr.awaiting_cond != tr.pending_cond:
+            tr.awaiting_cond = None
+        if tr.confirmed_cond is not None and tr.confirmed_cond != tr.pending_cond:
+            tr.confirmed_cond = None
+
         if confirmed_now and cond in TAXONOMY_RULES:
-            # FIX NOTE 8: for the heat-emergency conditions, a stationary
-            # non-person blob can satisfy the motion thresholds just as
-            # easily as a real person standing still — require an actual
-            # person-shaped detection before letting these confirm.
-            if cond in PERSON_VERIFY_REQUIRED and not verify_person_present(canvas, tr.bbox):
-                tr.reject_pending()
-            else:
-                info = TAXONOMY_RULES[cond]
-                label = f"ALERT: {info['en'].upper()} ({conf*100:.0f}%)"
+            tr.awaiting_cond = cond
+            tr.awaiting_conf = conf
+
+        if tr.awaiting_cond is not None and tr.awaiting_cond == tr.pending_cond:
+            if tr.person_confidence_ok(PERSON_CHECK_MIN_SAMPLES, PERSON_HIT_RATIO_REQUIRED):
+                info = TAXONOMY_RULES[tr.awaiting_cond]
+                label = f"ALERT: {info['en'].upper()} ({tr.awaiting_conf*100:.0f}%)"
 
                 box = refine_person_box(canvas, tr.bbox)
                 x, y, w, h = pad_box(box, canvas.shape)
@@ -980,18 +1073,31 @@ def process_video_frame(frame, frame_idx, state, sensitivity):
                 cv2.rectangle(canvas, (x, max(y - 24, 0)), (x + tw + 10, max(y, 24)), (0, 0, 255), -1)
                 cv2.putText(canvas, label, (x + 5, max(y - 7, 17)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-                last_f = state["global_cd"].get(cond, -9999)
+                last_f = state["global_cd"].get(tr.awaiting_cond, -9999)
                 if frame_idx - last_f > 60:
-                    state["global_cd"][cond] = frame_idx
-                    new_alerts.append((cond, conf))
-        elif tr.pending_cond in TAXONOMY_RULES and tr.pending_count >= confirm_needed_here:
-            # Already-confirmed, ongoing condition on a later frame — keep
-            # the box visible without re-logging a duplicate alert.
-            info = TAXONOMY_RULES[tr.pending_cond]
+                    state["global_cd"][tr.awaiting_cond] = frame_idx
+                    new_alerts.append((tr.awaiting_cond, tr.awaiting_conf))
+
+                tr.confirmed_cond = tr.awaiting_cond
+                tr.awaiting_cond = None
+            elif tr.person_checks >= PERSON_CHECK_MAX_SAMPLES:
+                # FIX NOTE 8/13: evidence budget exhausted without a
+                # confident majority of "yes, this is a person" — treat
+                # as a non-person and give up on this classification
+                # rather than waiting forever.
+                tr.reject_pending()
+            # else: motion is confirmed but liveness evidence is still
+            # accumulating — wait, don't draw yet, don't re-fire later.
+        elif tr.confirmed_cond is not None and tr.confirmed_cond == tr.pending_cond:
+            # Already fired (motion-confirmed AND person-verified) and
+            # still ongoing this frame — keep the box visible without
+            # re-logging a duplicate alert.
+            info = TAXONOMY_RULES[tr.confirmed_cond]
             box = refine_person_box(canvas, tr.bbox)
             x, y, w, h = pad_box(box, canvas.shape)
             cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 0, 255), 3)
             cv2.putText(canvas, info["en"].upper(), (x + 5, max(y - 7, 17)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
 
     return canvas, new_alerts, len(state["tracks"])
 
